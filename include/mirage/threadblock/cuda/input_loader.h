@@ -39,8 +39,8 @@ public:
     int smem_num_column = stensor_matrix_shape.y;
     int dmem_num_column = dtensor_matrix_shape.y;
     for (int idx = thread_id; idx < num_elements; idx += num_threads) {
-      int dmem_row_idx = matrix_offset.row_value() + idx / smem_num_column;
-      int dmem_column_idx = matrix_offset.column_value() + idx % smem_num_column;
+      int dmem_row_idx = matrix_offset.row() + idx / smem_num_column;
+      int dmem_column_idx = matrix_offset.column() + idx % smem_num_column;
       assert(dmem_column_idx < dmem_num_column);
       smem_ptr[idx] =
           dmem_ptr[dmem_row_idx * dmem_num_column + dmem_column_idx];

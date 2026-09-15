@@ -20,24 +20,26 @@
 namespace cutlass {
 
 // Minimal MatrixCoord used by src/kernel/cuda/customized_kernel.cu.
+// Keep the accessor names (row/column) identical to upstream CUTLASS so
+// callers do not need to change.
 struct MatrixCoord {
-  int row;
-  int column;
+  int row_;
+  int column_;
 
   CUTLASS_HOST_DEVICE
-  MatrixCoord() : row(0), column(0) {}
+  MatrixCoord() : row_(0), column_(0) {}
 
   CUTLASS_HOST_DEVICE
-  MatrixCoord(int r, int c) : row(r), column(c) {}
+  MatrixCoord(int r, int c) : row_(r), column_(c) {}
 
   CUTLASS_HOST_DEVICE
-  int row_value() const {
-    return row;
+  int row() const {
+    return row_;
   }
 
   CUTLASS_HOST_DEVICE
-  int column_value() const {
-    return column;
+  int column() const {
+    return column_;
   }
 };
 
