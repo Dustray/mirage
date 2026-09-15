@@ -88,6 +88,12 @@ endif()
 
 #set CUTLASS
 set(CUTLASS_DIR ${PROJECT_SOURCE_DIR}/deps/cutlass)
+# For non-NVIDIA toolchains (e.g. Hygon DTK / HCU), use the minimal CUTLASS
+# compatibility layer so that Mirage's main library can compile without the
+# full NVIDIA CUTLASS tree (which contains PTX that cannot target AMD CDNA).
+# The compat layer headers shadow the small subset of CUTLASS headers that the
+# main library actually includes.
+include_directories(include/mirage_compat)
 include_directories(deps/cutlass/include)
 include_directories(deps/cutlass/tools/util/include)
 

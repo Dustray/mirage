@@ -37,7 +37,10 @@
 #include "mirage/threadblock/serializer/rms_norm_serializer.h"
 #include "mirage/utils/cuda_helper.h"
 #include "mirage/utils/fingerprint_functions.h"
-#include "mirage/warp/cuda/matmul.h"
+// Note: mirage/warp/cuda/matmul.h is only needed for the GemmExecutor path,
+// which is not used on non-NVIDIA targets. Keep it out of the main-library
+// compile to avoid pulling in CUTLASS warp GEMM headers.
+// #include "mirage/warp/cuda/matmul.h"
 
 namespace mirage {
 namespace kernel {

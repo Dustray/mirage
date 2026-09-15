@@ -99,6 +99,7 @@ def config_cython():
                     ["%s/%s" % (cython_path, fn)],
                     include_dirs=[
                         path.join(mirage_path, "include"),
+                        path.join(mirage_path, "include", "mirage_compat"),
                         path.join(mirage_path, "deps", "json", "include"),
                         path.join(mirage_path, "deps", "cutlass", "include"),
                         path.join(mirage_path, "deps", "cutlass", "tools", "util", "include"),
@@ -265,7 +266,11 @@ INCLUDE_BASE = "python/mirage/include"
 @contextmanager
 def copy_include():
     if not path.exists(INCLUDE_BASE):
-        src_dirs = ["deps/cutlass/include", "deps/json/include"]
+        src_dirs = [
+            "include/mirage_compat",
+            "deps/cutlass/include",
+            "deps/json/include",
+        ]
         for src_dir in src_dirs:
             shutil.copytree(src_dir, path.join(INCLUDE_BASE, src_dir))
         # copy mirage/transpiler/runtime/*
