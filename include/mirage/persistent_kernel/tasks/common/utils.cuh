@@ -59,11 +59,16 @@ __device__ __forceinline__ void
 }
 
 __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
+#if defined(__HIP_PLATFORM_AMD__)
+  // HIP: use __shfl_xor with width=64 for native AMD wavefronts
+  return __shfl_xor(x, lane_mask, 64);
+#else
   float y;
   asm volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
                : "=f"(y)
                : "f"(x), "r"(lane_mask));
   return y;
+#endif
 }
 
 /*!
@@ -71,9 +76,14 @@ __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
  * \param x input
  */
 __device__ __forceinline__ float ptx_exp2(float x) {
+#if !defined(__NVCC__)
+  /* HIP/Clang: no PTX; use standard libm */
+  return exp2f(x);
+#else
   float y;
   asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
+#endif
 }
 
 /*!
@@ -81,9 +91,14 @@ __device__ __forceinline__ float ptx_exp2(float x) {
  * \param x input
  */
 __forceinline__ __device__ float ptx_log2(float x) {
+#if !defined(__NVCC__)
+  /* HIP/Clang: no PTX; use standard libm */
+  return log2f(x);
+#else
   float y;
   asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
   return y;
+#endif
 }
 
 static __device__ __forceinline__ int lane_id() {

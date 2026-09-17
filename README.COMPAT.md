@@ -80,6 +80,7 @@ cmake .. -DCMAKE_BUILD_TYPE=Release \
 ```
 
 > 注意：Z3 路径请根据实际环境调整。如果 `abstract_subexpr` 和 `formal_verifier` 尚未构建，需要先按项目原流程构建这两个 Rust 依赖。
+> 注意：DTK/HCU 环境在构建前需要先 `source /opt/dtk/cuda/env.sh`。
 
 ### 4.3 编译主库
 
@@ -124,9 +125,30 @@ ls -lh libmirage_runtime.a
 - 本兼容层仅覆盖主库 `mirage_runtime` 编译所需的 CUTLASS 符号。
 - Blackwell/Hopper 专用任务头文件（`include/mirage/persistent_kernel/tasks/` 下的 `blackwell_*.cuh`）属于 JIT 生成代码，不参与主库编译，当前未做处理。
 - 实际在 HCU 上执行生成的 kernel 还需要进一步将 CUDA kernel 代码转译为 HIP/ROCm，或依赖 DTK 的 CUDA 兼容运行时支持。
+- 通用路径（`ampere/`、`tasks/common/`）中的 PTX 内联汇编已增加 HIP 分支处理，详见第 8 节。
+- 在 HCU 上实际执行 megakernel 时，JIT 生成的 kernel 仍可能包含 Blackwell/Hopper 专用 PTX，需要进一步处理或限制只使用 ampere 路径。
 
 ## 7. 后续工作
 
 - [ ] 验证 Python 包能否完整安装并导入 `mirage`。
 - [ ] 运行简单的 fingerprint/operator 测试，确认数值正确性。
 - [ ] 评估是否需要为 HCU 实现自定义 kernel backend，替代 JIT 生成的 CUDA kernel。
+
+## 8. PTX/ASM 内联汇编兼容化
+
+Mirage persistent kernel 在通用路径（`ampere` 及 `tasks/common`）中使用了少量 PTX 内联汇编。为了让这些代码在 HCU/ROCm 上能编译，对以下文件做了 `#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)` 分支：
+
+- `include/mirage/persistent_kernel/profiler.h`
+  - `sleep_cycles()` / `get_timestamp()`：NVIDIA 路径保留 `%globaltimer_lo` PTX；HIP 路径改用 `__builtin_amdgcn_s_memrealtime()`。
+- `include/mirage/persistent_kernel/mpk_atoms.cuh`
+  - `atom_add_release_gpu_s32/u64`、`atom_cas_release_gpu_u64`：HIP 路径改用 `atomicAdd` / `atomicCAS` + `__builtin_amdgcn_fence(..., "agent")`。
+  - `ld_acquire_gpu_u64`、`ld_acquire_sys_u64`、`ld_relaxed_gpu_u64`、`st_relaxed_gpu_u64`：HIP 路径改用 `__atomic_load_n` / `__atomic_store_n` + 合适的 `__builtin_amdgcn_fence`。
+  - `ld_acquire_sys_i32`、`st_release_sys_i32`：HIP 路径改用 `__atomic_load_n` / `__atomic_store_n` + `__builtin_amdgcn_fence(..., "system")`。
+  - 新增 `threadfence_gpu()`：HIP 路径映射到 `__builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent")`。
+- `include/mirage/persistent_kernel/tasks/common/utils.cuh`
+  - `shfl_xor_sync`：HIP 路径改用 `__shfl_xor(x, lane_mask, warpSize)`。
+  - `ptx_exp2` / `ptx_log2`：HIP 路径改用标准 `exp2f` / `log2f`。
+- `include/mirage/persistent_kernel/tasks/common/copy_sm80.cuh`
+  - `cp.async.*` 与 `ldmatrix` 是 Ampere+ 特性，在 HCU 上 `__CUDA_ARCH__` 不会 >= 800，因此 `CP_ASYNC_SM80_ENABLED` 不会定义，这些函数在 HIP 路径下为空操作；NVIDIA 路径保持原 PTX 不变。
+
+所有修改都保留 NVIDIA 路径的原始 PTX 代码，仅在 HIP/HCU 编译时走替代实现。

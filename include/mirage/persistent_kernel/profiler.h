@@ -46,11 +46,19 @@ constexpr uint32_t EVENT_END = 0x1;
 constexpr uint32_t EVENT_INSTANT = 0x2;
 
 __device__ __forceinline__ void sleep_cycles(uint32_t cycles) {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
+  uint64_t start = __builtin_amdgcn_s_memrealtime();
+  uint64_t now;
+  do {
+    now = __builtin_amdgcn_s_memrealtime();
+  } while ((now - start) < static_cast<uint64_t>(cycles));
+#else
   uint32_t start = 0, now = 0;
   asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(start));
   do {
     asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(now));
   } while ((now - start) < cycles);
+#endif
 }
 
 __device__ __forceinline__ uint32_t encode_tag(uint32_t block_group_idx,
@@ -82,9 +90,15 @@ __device__ __forceinline__ uint32_t make_event_tag_instant(uint32_t base_tag,
 }
 
 __device__ __forceinline__ uint32_t get_timestamp() {
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
+  // s_memrealtime on MI300X runs at ~100 MHz (10ns per tick).
+  // Scale to nanoseconds to match NVIDIA's globaltimer_lo (1 GHz).
+  return static_cast<uint32_t>((__builtin_amdgcn_s_memrealtime() * 10) & 0xFFFFFFFFu);
+#else
   uint32_t volatile ret;
   asm volatile("mov.u32 %0, %globaltimer_lo;" : "=r"(ret));
   return ret;
+#endif
 }
 
 struct ProfilerEntry {

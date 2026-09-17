@@ -48,6 +48,9 @@ cuda_library_dirs = [
 ]
 
 z3_path = path.dirname(z3.__file__)
+# ==== MIRAGE HIP COMPAT: 默认走 HIP 构建，MIRAGE_USE_HIP=0 退回 CUDA ====
+_mirage_hip_build = os.environ.get("MIRAGE_USE_HIP", "1") != "0"
+# ==== end MIRAGE HIP COMPAT ====
 
 # Use version.py to get package version
 version_file = os.path.join(os.path.dirname(__file__), "python/mirage/version.py")
@@ -140,6 +143,97 @@ def config_cython():
                     language="c++",
                 )
             )
+        # ==== MIRAGE HIP COMPAT: pure addition, upstream line below is untouched ====
+        if _mirage_hip_build:
+            # The compat CUDA headers must shadow every other include dir:
+            # mirage headers include <vector_types.h> and friends, which only
+            # exist in the compat layer on HIP toolchains. The static
+            # mirage_runtime archive also references HIP symbols, so the
+            # cython extensions link the HIP runtime libraries instead of
+            # the CUDA ones.
+            _hip_compat_inc = path.join(
+                mirage_path, "include", "mirage_compat", "cuda")
+            _hip_toolkit = (
+                os.environ.get("ROCM_PATH")
+                or os.environ.get("DTK_ROOT")
+                or "/opt/dtk"
+            )
+            _hip_extra_incs = [
+                _hip_compat_inc,
+                path.join(_hip_toolkit, "hip", "include"),
+                path.join(_hip_toolkit, "include"),
+            ]
+            _hip_lib_dir = path.join(_hip_toolkit, "lib")
+            # Copy the z3 runtime library next to the built extensions so the
+            # upstream "$ORIGIN/lib" rpath resolves it: under pip build
+            # isolation z3_path points into an ephemeral overlay, so an
+            # rpath to it would go stale right after the build.
+            _z3_lib_src = path.join(z3_path, "lib")
+            _z3_lib_dst = path.join(mirage_path, "python", "mirage", "lib")
+            if path.isdir(_z3_lib_src):
+                os.makedirs(_z3_lib_dst, exist_ok=True)
+                for _z3_so in os.listdir(_z3_lib_src):
+                    if _z3_so.startswith("libz3.so"):
+                        shutil.copy2(
+                            path.join(_z3_lib_src, _z3_so),
+                            path.join(_z3_lib_dst, _z3_so),
+                        )
+            for _ext in ret:
+                _ext.include_dirs = _hip_extra_incs + [
+                    _d for _d in _ext.include_dirs
+                    if _d not in _hip_extra_incs
+                ]
+                _ext.extra_compile_args = _ext.extra_compile_args + [
+                    # Matches the CMake HIP build: platform macro for the
+                    # HIP headers and the warp-sync declaration gate that
+                    # DTK's clang pipeline leaves undefined. The forced
+                    # include mirrors nvcc's implicit <cuda_runtime.h>.
+                    "-D__HIP_PLATFORM_AMD__=1",
+                    "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+                    "-include",
+                    "cuda_runtime.h",
+                ]
+                _ext.libraries = ["amdhip64", "hipblas"] + [
+                    _lib for _lib in _ext.libraries
+                    if _lib not in ("cudadevrt", "cudart_static",
+                                    "cudart", "cuda")
+                ]
+                _ext.extra_link_args = _ext.extra_link_args + [
+                    # Upstream headers define some CUTLASS_HOST_DEVICE
+                    # helpers (e.g. the deserialize_*_op_parameters in
+                    # threadblock/serializer/*.h and get_reduction_dim in
+                    # utils/cuda_helper.h) out-of-line, so several archive
+                    # members carry the same definition. The nvcc build never
+                    # extracts those members together; the HIP build's symbol
+                    # demand does. All duplicates come from the same header,
+                    # so keeping the linker's first definition is safe.
+                    "-Wl,--allow-multiple-definition",
+                    # -lz3 resolves against the z3 wheel's private lib dir,
+                    # whose SONAME (libz3.so.4.16) is not on the default
+                    # loader path; add an rpath so import works without
+                    # LD_LIBRARY_PATH.
+                    "-Wl,-rpath,%s" % path.join(z3_path, "lib"),
+                    # The HIP archive was compiled by clang with -fopenmp,
+                    # which emits Intel-runtime (__kmpc_*) symbols resolved by
+                    # libomp (bundled with the DTK compiler in dcc/lib). The
+                    # g++ link step below would otherwise resolve OpenMP via
+                    # libgomp and leave those symbols undefined.
+                    "-L%s" % path.join(_hip_toolkit, "dcc", "lib"),
+                    "-lomp",
+                    "-Wl,-rpath,%s" % path.join(_hip_toolkit, "dcc", "lib"),
+                    # Ubuntu 的 gcc 默认 --as-needed：出现在 mirage_runtime.a
+                    # 之前的 HIP 共享库（当时还没有符号引用）会被丢弃，导致
+                    # hipFree 等符号未解析；在静态库之后再链一次。
+                    "-Wl,--no-as-needed",
+                    "-lamdhip64",
+                    "-lhipblas",
+                    "-Wl,-rpath,%s" % _hip_lib_dir,
+                ]
+                _ext.library_dirs = [_hip_lib_dir] + [
+                    _d for _d in _ext.library_dirs
+                    if _d != _hip_lib_dir
+                ]
+        # ==== end MIRAGE HIP COMPAT ====
         return cythonize(ret, compiler_directives={"language_level": 3})
     except ImportError:
         print("WARNING: cython is not installed!!!")

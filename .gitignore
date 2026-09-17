@@ -97,3 +97,5 @@ ncu_tmp
 !.claude/agents/
 !.claude/skills/**
 !.claude/agents/**
+
+deps/composable_kernel/

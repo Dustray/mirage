@@ -48,6 +48,8 @@
 #include "tasks/hopper/task_header.cuh"
 #elif defined(MIRAGE_GRACE_BLACKWELL)
 #include "tasks/blackwell/task_header.cuh"
+#elif defined(__HIP_PLATFORM_AMD__)
+#include "tasks/mi300/task_header.cuh"
 #else
 #include "tasks/ampere/task_header.cuh"
 #endif

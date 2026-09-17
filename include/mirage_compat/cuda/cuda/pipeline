@@ -1,0 +1,66 @@
+/* Copyright 2023-2024 CMU
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+// CUDA <cuda/pipeline> (libcu++) compatibility for HIP. Mirage does not use
+// this header on the HIP build path today (the Ampere cp.async pipeline code
+// in tasks/common/copy_sm80.cuh is compiled out via CP_ASYNC_SM80_ENABLED),
+// so only the small subset below is provided: cuda::memcpy_async built on
+// the synchronous primitives, plus a single-stage cuda::pipeline whose
+// arrive/wait map to block-level fences. Multi-stage producer/consumer
+// pipelines are intentionally not implemented.
+
+#include "cuda_pipeline_primitives.h"
+
+namespace cuda {
+
+enum thread_scope {
+  thread_scope_system,
+  thread_scope_gpu,
+  thread_scope_block,
+  thread_scope_thread
+};
+
+template <typename T>
+__device__ __forceinline__ void memcpy_async(T *__restrict__ dst_shared,
+                                             T const *__restrict__ src_global,
+                                             size_t size_and_align) {
+  __pipeline_memcpy_async(dst_shared, src_global, size_and_align);
+}
+
+enum class pipeline_role { producer, consumer };
+
+template <thread_scope Scope>
+class pipeline {
+public:
+  __device__ explicit pipeline(void * /*shared_state*/, pipeline_role role)
+      : role_(role) {}
+
+  __device__ void producer_acquire() {
+    // Synchronous copies: nothing to acquire.
+  }
+
+  __device__ void producer_commit() { __pipeline_commit(); }
+
+  __device__ void consumer_wait() { __pipeline_wait_prior(0); }
+
+  __device__ void consumer_release() {}
+
+private:
+  pipeline_role role_;
+};
+
+} // namespace cuda

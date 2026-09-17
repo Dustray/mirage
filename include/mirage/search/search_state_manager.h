@@ -22,8 +22,19 @@ public:
 template <typename T>
 class GlobalWorkerQueueManager : public SearchStateManager<T> {
 public:
+  // ==== MIRAGE HIP COMPAT: the upstream default argument `= 1000` is kept
+  // verbatim in the #else branch below. It is ill-formed under this libstdc++
+  // (the duration constructor taking a plain count is explicit), so the HIP
+  // build spells the conversion out; semantics are identical. ====
+#ifdef MIRAGE_USE_HIP
+  GlobalWorkerQueueManager(std::chrono::milliseconds timeout =
+                               std::chrono::milliseconds(1000))
+      : timeout(timeout){};
+#else
   GlobalWorkerQueueManager(std::chrono::milliseconds timeout = 1000)
       : timeout(timeout){};
+#endif
+  // ==== end MIRAGE HIP COMPAT ====
 
   void add_state(T const &c) override {
     std::lock_guard<std::mutex> lock(queue_mutex);

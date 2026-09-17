@@ -212,6 +212,20 @@ def _detect_cxx_standard():
         pass
     return "-std=c++17"
 
+def _is_hip_compiler(cc):
+    """Whether the JIT compiler is a HIP driver (hipcc / dcc -x hip)."""
+    return os.path.basename(cc).startswith("hipcc")
+
+def find_gpu_compiler():
+    """Locate the JIT compiler: prefer hipcc (DTK/ROCm), fall back to nvcc."""
+    cc = shutil.which("hipcc") or shutil.which("nvcc")
+    if cc is None:
+        raise RuntimeError(
+            "hipcc/nvcc not found. Please make sure the CUDA or HIP/ROCm "
+            "(e.g. DTK) toolchain is on PATH."
+        )
+    return cc
+
 def get_compile_command(
     mpk,
     target_cc,
@@ -343,6 +357,62 @@ def get_compile_command(
         specific_cmd = [
             "-arch=native",
         ]
+
+    # ==== MIRAGE HIP COMPAT: pure addition, upstream code above is untouched ====
+    is_hip = _is_hip_compiler(cc)
+    if is_hip:
+        # AMD path: the mi300 task directory is selected in
+        # persistent_kernel.cuh via __HIP_PLATFORM_AMD__; no TMA. The upstream
+        # chain above only builds nvcc flag lists (no side effects), so it is
+        # safe to run under HIP and override specific_cmd here.
+        gfx_arch = os.environ.get("MIRAGE_HIP_ARCH", "gfx936")
+        specific_cmd = [
+            f"--offload-arch={gfx_arch}",
+        ]
+        # Composable Kernel (ck_tile) based kernels are only compilable with
+        # real HIP headers (enabled by the mirage_compat/cuda layer), so they
+        # are opt-in via env: MPK_USE_CK_FMHA=1 / MPK_USE_CK_LINEAR=1.
+        for ck_flag in ("MPK_USE_CK_FMHA", "MPK_USE_CK_LINEAR"):
+            if os.environ.get(ck_flag, "0") == "1":
+                specific_cmd += [f"-D{ck_flag}"]
+        # hipcc (e.g. Hygon DTK `dcc -x hip`) is a clang-style driver: switch
+        # the generated .cu to HIP language mode, shadow the CUDA headers with
+        # include/mirage_compat/cuda, and drop nvcc-only flags. nvshmem's
+        # "-ccbin=mpic++" is nvcc-specific and is filtered below as well.
+        common_cmd = [cc, "-x", "hip"] + [
+            arg for arg in common_cmd[1:] if arg != "-lineinfo"
+        ] + [
+            "-gline-tables-only",
+            f"-I{os.path.join(mirage_inc_path, 'mirage_compat/cuda')}",
+            f"-I{os.path.join(mirage_deps_path, 'composable_kernel/include')}",
+            # Mirrors nvcc's implicit <cuda_runtime.h> include.
+            "-include",
+            "cuda_runtime.h",
+        ]
+        _hip_drop_prefixes = (
+            "-D__HIP_DEVICE_COMPILE__=",
+            "-rdc=",
+            "-use_fast_math",
+            "-lcuda",
+            "-lcudart",
+            "-Xcompiler=",
+            "--expt-relaxed-constexpr",
+            "-ccbin=",
+        )
+        flags = (
+            [flags[0]]
+            + [arg for arg in flags[1:] if not arg.startswith(_hip_drop_prefixes)]
+            + [
+                "-fPIC",
+                "-ffast-math",
+                "-D__HIP_PLATFORM_AMD__=1",
+                # DTK's clang pipeline does not define the macro that gates
+                # the HIP warp-sync (__shfl_*_sync) declarations; define it
+                # explicitly (matches the upstream ROCm behavior).
+                "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+            ]
+        )
+    # ==== end MIRAGE HIP COMPAT ====
     
     if profiling:
         flags = flags + ["-DMPK_ENABLE_PROFILING"]
@@ -3030,6 +3100,7 @@ class PersistentKernel:
             so_output_path = os.path.join(output_dir, f"mpk_launcher_rank{self.mpi_rank}.cpython-{sys.version_info.major}{sys.version_info.minor}-x86_64-linux-gnu.so")
 
         cc = shutil.which("nvcc")
+        cc = find_gpu_compiler()  # MIRAGE HIP COMPAT: prefer hipcc, fall back to nvcc
         if cc is None:
             raise RuntimeError(
                 "nvcc not found. Please make sure you have installed CUDA."

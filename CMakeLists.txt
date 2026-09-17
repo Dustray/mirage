@@ -9,12 +9,60 @@ else()
   endif()
 endif()
 
+# ==== MIRAGE HIP COMPAT: 默认启用 HIP（设 MIRAGE_USE_HIP=0 退回 CUDA）====
+if ("$ENV{MIRAGE_USE_HIP}" STREQUAL "0")
+  set(USE_HIP OFF)
+endif()
+option(USE_HIP
+  "Build with a HIP/ROCm toolchain (hipcc, e.g. Hygon DTK) instead of nvcc"
+  ON)
+
+if (USE_HIP)
+  # project() 之前必须把 C++ 编译器定为 hipcc
+  set(MIRAGE_CXX_IS_HIPCC OFF)
+  if(DEFINED CMAKE_CXX_COMPILER)
+    get_filename_component(_MIRAGE_CXX_NAME "${CMAKE_CXX_COMPILER}" NAME)
+    if(_MIRAGE_CXX_NAME MATCHES "hipcc")
+      set(MIRAGE_CXX_IS_HIPCC ON)
+    endif()
+  elseif(DEFINED ENV{CXX})
+    get_filename_component(_MIRAGE_CXX_NAME "$ENV{CXX}" NAME)
+    if(_MIRAGE_CXX_NAME MATCHES "hipcc")
+      set(MIRAGE_CXX_IS_HIPCC ON)
+    endif()
+  endif()
+  if(NOT MIRAGE_CXX_IS_HIPCC)
+    find_program(MIRAGE_HIPCC_EXEC hipcc
+      HINTS ${ROCM_PATH} $ENV{ROCM_PATH} $ENV{DTK_ROOT} /opt/dtk /opt/rocm
+      PATH_SUFFIXES bin
+      NO_DEFAULT_PATH)
+    if(NOT MIRAGE_HIPCC_EXEC)
+      find_program(MIRAGE_HIPCC_EXEC hipcc)
+    endif()
+    if(NOT MIRAGE_HIPCC_EXEC)
+      message(FATAL_ERROR
+        "USE_HIP is ON but hipcc was not found. Source the DTK/ROCm env.sh "
+        "or pass -DCMAKE_CXX_COMPILER=<path-to-hipcc> explicitly.")
+    endif()
+    set(CMAKE_CXX_COMPILER "${MIRAGE_HIPCC_EXEC}" CACHE FILEPATH
+      "C++ compiler (hipcc for USE_HIP builds)" FORCE)
+  endif()
+endif()
+
+# ==== MIRAGE HIP COMPAT ====
+if (USE_HIP)
+  project(MIRAGE LANGUAGES C CXX)
+else()
+# ==== end MIRAGE HIP COMPAT ====
 if (NOT "${USE_CUDA}" STREQUAL "OFF")
   project(MIRAGE LANGUAGES C CXX CUDA)
 else()
   message(STATUS "USE_CUDA is OFF, will not use CUDA")
   project(MIRAGE LANGUAGES C CXX)
 endif()
+# ==== MIRAGE HIP COMPAT ====
+endif()
+# ==== end MIRAGE HIP COMPAT ====
 
 #include directories
 include_directories(${CMAKE_INCLUDE_PATH})
@@ -50,6 +98,9 @@ include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-std=c++17" SUPPORT_CXX17)
 
 #set CUDA version
+# ==== MIRAGE HIP COMPAT ====
+if (NOT USE_HIP)
+# ==== end MIRAGE HIP COMPAT ====
 if (NOT "${USE_CUDA}" STREQUAL "OFF")
   include(deps/cutlass/CUDA.cmake)
   string(REPLACE "." ";" CUDA_VERSION_PARTS ${CUDA_VERSION})
@@ -57,6 +108,9 @@ if (NOT "${USE_CUDA}" STREQUAL "OFF")
   list(GET CUDA_VERSION_PARTS 1 CUDA_VERSION_MINOR)
   list(APPEND CMAKE_CUDA_FLAGS "-D__CUDACC_VER_MAJOR__=${CUDA_VERSION_MAJOR} -D__CUDACC_VER_MINOR__=${CUDA_VERSION_MINOR}")
 endif()
+# ==== MIRAGE HIP COMPAT ====
+endif()
+# ==== end MIRAGE HIP COMPAT ====
 
 # TODO: Currently disable CUTLASS_ARCH_MMA_SM80_ENABLED flag
 # since we target Triton to perform codegen
@@ -71,7 +125,34 @@ else()
   set(CMAKE_CXX_FLAGS "-fopenmp -O2 -Wall -fPIC ${CMAKE_CXX_FLAGS}")
 endif()
 
+# ==== MIRAGE HIP COMPAT ====
+if (USE_HIP)
+  # 用 hipcc 把 .cu 编成 HIP，CUDA API 经 include/mirage_compat/cuda 映射到 HIP
+  include(cmake/hip.cmake)
+  find_hip()
+  list(APPEND MIRAGE_SRCS ${MIRAGE_CUDA_SRCS})
+  set_source_files_properties(${MIRAGE_CUDA_SRCS} PROPERTIES
+    LANGUAGE CXX
+    COMPILE_OPTIONS "-x;hip")
+  # 兼容头目录放在最前，遮蔽环境里的 CUDA 头
+  include_directories(include/mirage_compat/cuda)
+  include_directories(${HIP_INCLUDE_DIRS})
+  # clang 比 nvcc 更严格的诊断降为警告；补上 DTK 不定义的 warp-sync 宏；
+  # hipcc 不像 nvcc 会自动包含 <cuda_runtime.h>，强制包含兼容 shim
+  string(APPEND CMAKE_CXX_FLAGS
+    " -Wno-non-pod-varargs -Wno-return-type -Wno-error=c++11-narrowing"
+    " -Wno-error=deprecated-declarations"
+    " -DHIP_ENABLE_WARP_SYNC_BUILTINS"
+    " -include cuda_runtime.h")
+  list(APPEND MIRAGE_LINK_LIBS ${HIP_RUNTIME_LIBRARY})
+  list(APPEND MIRAGE_LINK_LIBS ${HIPBLAS_LIBRARY})
+endif()
+# ==== end MIRAGE HIP COMPAT ====
+
 #set CUDA
+# ==== MIRAGE HIP COMPAT ====
+if (NOT USE_HIP)
+# ==== end MIRAGE HIP COMPAT ====
 if (NOT "${USE_CUDA}" STREQUAL "OFF")
   include(cmake/cuda.cmake)
   find_cuda(${USE_CUDA})
@@ -85,14 +166,13 @@ if (NOT "${USE_CUDA}" STREQUAL "OFF")
     message(FATAL_ERROR "Cannot find CUDA, USE_CUDA=" ${USE_CUDA})
   endif(CUDA_FOUND)
 endif()
+# ==== MIRAGE HIP COMPAT ====
+endif()
+# ==== end MIRAGE HIP COMPAT ====
 
 #set CUTLASS
 set(CUTLASS_DIR ${PROJECT_SOURCE_DIR}/deps/cutlass)
-# For non-NVIDIA toolchains (e.g. Hygon DTK / HCU), use the minimal CUTLASS
-# compatibility layer so that Mirage's main library can compile without the
-# full NVIDIA CUTLASS tree (which contains PTX that cannot target AMD CDNA).
-# The compat layer headers shadow the small subset of CUTLASS headers that the
-# main library actually includes.
+# ==== MIRAGE HIP COMPAT: 非 NVIDIA 工具链用 include/mirage_compat 的最小 CUTLASS 兼容层 ====
 include_directories(include/mirage_compat)
 include_directories(deps/cutlass/include)
 include_directories(deps/cutlass/tools/util/include)
@@ -183,7 +263,11 @@ endif()
 include_directories(${FORMAL_VERIFIER_LIB})
 list(APPEND MIRAGE_LINK_LIBS ${FORMAL_VERIFIER_LIBRARIES})
 
+# ==== MIRAGE HIP COMPAT ====
+if (NOT USE_HIP)
 set_target_properties(mirage_runtime PROPERTIES CUDA_ARCHITECTURES "75;80;86;89;90")
+endif()
+# ==== end MIRAGE HIP COMPAT ====
 
 target_compile_features(mirage_runtime PUBLIC cxx_std_17)
 
@@ -191,6 +275,15 @@ if (NOT "${USE_CUDA}" STREQUAL "OFF")
   target_compile_definitions(mirage_runtime PUBLIC MIRAGE_BACKEND_USE_CUDA)
   target_compile_definitions(mirage_runtime PUBLIC MIRAGE_FINGERPRINT_USE_CUDA)
 endif()
+
+# ==== MIRAGE HIP COMPAT ====
+if (USE_HIP)
+  # HIP 构建沿用 MIRAGE_BACKEND_USE_CUDA 代码路径，CUDA API 由兼容层映射
+  target_compile_definitions(mirage_runtime PUBLIC MIRAGE_BACKEND_USE_CUDA)
+  target_compile_definitions(mirage_runtime PUBLIC MIRAGE_FINGERPRINT_USE_CUDA)
+  target_compile_definitions(mirage_runtime PUBLIC MIRAGE_USE_HIP)
+endif()
+# ==== end MIRAGE HIP COMPAT ====
 
 if (NOT "${USE_NKI}" STREQUAL "OFF")
   target_compile_definitions(mirage_runtime PUBLIC MIRAGE_BACKEND_USE_NKI)
