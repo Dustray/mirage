@@ -16,7 +16,15 @@
 #pragma once
 
 #include "mirage/config.h"
+// Include platform definition first - MUST be before any HIP headers
+#include "mirage/hip_platform.h"
+// Don't redefine MIRAGE_BACKEND_USE_ROCM if already defined via compiler flags
+#ifdef MIRAGE_BACKEND_USE_ROCM
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime_api.h>
+#else
 #include <cuda_runtime.h>
+#endif
 
 #ifdef USE_NVSHMEM
 #include <nvshmem.h>
@@ -32,7 +40,12 @@ constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 6 * 1024;
 constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 3 * 1024;
 #endif
 
-#if defined(MODE_ONLINE_NOTOKEN) || defined(MODE_MULTI_TURN)
+// AMD MI300 (gfx942) has up to 64KB LDS per workgroup by default
+// Can be increased to 128KB with dynamic LDS, but let's use conservative 60KB
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300) || (MPK_TARGET_CC == 94)
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    60 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif defined(MODE_ONLINE_NOTOKEN) || defined(MODE_MULTI_TURN)
 // Have to be smaller for vllm compatibility, or program will stuck
 #if MPK_TARGET_CC >= 90
 constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
@@ -106,6 +119,37 @@ enum TaskType {
   TASK_RMS_NORM = 119,
   TASK_LINEAR = 120,
   TASK_IDENTITY = 121,
+  // MI300 Tasks
+  TASK_SPLITK_LINEAR_MI300 = 129,
+  TASK_PAGED_ATTENTION_SPLIT_KV_MI300 = 130,
+  TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300 = 131,
+  TASK_SPLITK_REDUCE_MI300 = 132,
+  TASK_SPLITK_LINEAR_RES_ATOMIC_MI300 = 133,
+  TASK_KV_PREP_MI300 = 134,
+  TASK_PAGED_ATTENTION_CK_MI300 = 135,
+  TASK_GANG_LINEAR_MI300 = 136,
+  TASK_GANG_LINEAR_RES_MI300 = 137,
+  TASK_GANG_ATTN_SPLIT_KV_MI300 = 138,
+  TASK_GANG_ATTN_MERGE_MI300 = 139,
+  TASK_KV_CACHE_UPDATE_MI300 = 140,
+  TASK_PAGED_ATTENTION_CK_FMHA_SPLIT_KV_MI300 = 141,
+  TASK_GANG_LINEAR_SILU_MI300 = 142,
+  TASK_LINEAR_SILU_MI300 = 182,
+  TASK_GANG_RMS_NORM_MI300 = 143,
+  TASK_GANG_SPLITK_LINEAR_RES_MI300 = 144,
+  TASK_GANG_KSPLIT_GEMM_MI300 = 145,
+  TASK_GANG_KSPLIT_FINALIZE_MI300 = 146,
+  TASK_GANG_LINEAR_N_TILING_MI300 = 147,
+  TASK_GANG_LINEAR_RES_N_TILING_MI300 = 148,
+  TASK_GANG_LINEAR_MSPLIT_MI300 = 183,
+  TASK_GANG_LINEAR_RES_MSPLIT_MI300 = 184,
+  // MI300/MI350 MoE Tasks
+  TASK_MOE_W13_LINEAR_MI300 = 170,
+  TASK_MOE_W2_LINEAR_MI300 = 171,
+  TASK_MOE_TOPK_SOFTMAX_MI300 = 172,
+  TASK_MOE_MUL_SUM_ADD_MI300 = 173,
+  TASK_GANG_MOE_W13_LINEAR_MI300 = 174,
+  TASK_GANG_MOE_W2_LINEAR_MI300 = 175,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
@@ -314,6 +358,7 @@ struct alignas(16) TaskDesc {
     }
 #endif
   }
+  __host__ __device__
   TaskDesc() {
     task_metadata.raw_payload = ~0ull;
   }
@@ -426,9 +471,37 @@ struct RuntimeConfig {
 #endif
   void *profiler_buffer;
   bool split_worker_scheduler;
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  void *worker_log_buffer;  // device buffer: WorkerLogEntry[] for execute_worker debug
+  int *worker_log_count;    // device counter for log entries
+  // Per-XCD event counter replication for reduced cross-XCD polling contention
+  // Each XCD has a local copy of event counters, updated by a leader worker
+  EventCounter *xcd_local_event_counters;  // [NUM_XCDS * num_events] - per-XCD counter copies
+  int *xcd_leader_worker;                   // [NUM_XCDS] - worker ID that is leader for each XCD (-1 if none)
+  int num_xcds;                             // Number of XCDs (8 for MI300X)
+  // Runtime XCD mapping: workers write their hardware XCD ID at startup,
+  // schedulers read it to build XCD-aligned worker lists
+  int *worker_xcd_map;           // [num_workers] — worker_id → actual hardware XCD ID
+  int *worker_xcd_ready_count;   // atomic counter: workers increment after writing xcd_map
+  int *xcd_event_num_tasks;      // [num_xcds * num_events] — per-XCD per-event task count (set by scheduler)
+  // Combined kernel: dynamic role election — one scheduler per XCD
+  int *xcd_scheduler_claimed;    // [num_xcds] — atomicCAS to claim XCD as scheduler (-1 = unclaimed)
+  int *dynamic_worker_id_counter; // atomic counter for assigning worker IDs in combined kernel
+#endif
+  // Per-event wall-clock timing: records s_memrealtime when each event fires
+  // (last worker to finish). Wall time between consecutive events = phase duration.
+  unsigned long long *event_timing_buffer;  // [max_entries * 2]: pairs of (event_index, timestamp)
+  int *event_timing_count;                  // atomic write position
+  int event_timing_max_entries;             // buffer capacity
+#ifdef MIRAGE_BACKEND_USE_ROCM
+  hipStream_t worker_stream, scheduler_stream;
+  hipEvent_t prepare_done_event;
+  hipEvent_t worker_done_event, scheduler_done_event;
+#else
   cudaStream_t worker_stream, scheduler_stream;
   cudaEvent_t prepare_done_event;
   cudaEvent_t worker_done_event, scheduler_done_event;
+#endif
 #ifdef USE_NVSHMEM
   nvshmem_team_t *nvshmem_teams;
 #endif

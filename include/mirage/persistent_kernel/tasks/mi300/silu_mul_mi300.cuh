@@ -14,7 +14,7 @@
  */
 #pragma once
 #include "tasks/common/common_header.cuh"
-#include <cuda_bf16.h>
+#include <hip/hip_bf16.h>
 
 namespace kernel {
 
@@ -24,7 +24,7 @@ namespace kernel {
 __device__ __forceinline__ void nt_store_u64_hip(void* addr, uint64_t val) {
     __builtin_nontemporal_store(val, reinterpret_cast<uint64_t*>(addr));
 }
-__device__ __forceinline__ void nt_store_bf16_hip(__nv_bfloat16* addr, __nv_bfloat16 val) {
+__device__ __forceinline__ void nt_store_bf16_hip(__hip_bfloat16* addr, __hip_bfloat16 val) {
     *addr = val;  // scalar bf16 stores are rare (remainder path), use default
 }
 #endif
@@ -50,7 +50,7 @@ __device__ __forceinline__ void silu_mul_task_impl(void const *input_ptr,
 #ifdef MPK_ENABLE_DEVICE_TASK_TIMING
   unsigned long long _t0 = __builtin_amdgcn_s_memrealtime();
 #endif
-  using bf16 = __nv_bfloat16;
+  using bf16 = __hip_bfloat16;
 
   const bf16* __restrict__ d_input = static_cast<const bf16*>(input_ptr);
   const bf16* __restrict__ d_mul = static_cast<const bf16*>(input_ptr) + OUTPUT_SIZE;

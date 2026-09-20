@@ -15,7 +15,7 @@
 
 #pragma once
 #include "tasks/common/common_header.cuh"
-#include <cooperative_groups.h>
+#include <hip/hip_cooperative_groups.h>
 
 namespace kernel {
 

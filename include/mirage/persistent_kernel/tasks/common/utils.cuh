@@ -106,7 +106,15 @@ static __device__ __forceinline__ int lane_id() {
 }
 
 static __device__ __forceinline__ int warp_id() {
+// ==== MIRAGE HIP COMPAT: AMD wave64 下 __shfl_sync 的 mask 必须是 64-bit，
+// 且默认 width 按 64-lane wave 广播会破坏 32 线程逻辑 warp 语义；该 shuffle
+// 不改变取值（每线程已知自己的 threadIdx.x/NUM_THREADS_PER_WARP），直接返回 ====
+#if defined(__HIP_PLATFORM_AMD__)
+  return threadIdx.x / NUM_THREADS_PER_WARP;
+#else
   return __shfl_sync(0xffffffff, threadIdx.x / NUM_THREADS_PER_WARP, 0);
+#endif
+  // ==== end MIRAGE HIP COMPAT ====
 }
 
 template <typename T, int NUM_ELEMENTS>

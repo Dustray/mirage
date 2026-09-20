@@ -78,7 +78,7 @@ __device__ __noinline__ void
 
   using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
   using BlockWarps = sequence<MWarp, NWarp>;
-  using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
+  using WarpTile = sequence<16, 16, 32>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
   using GemmTraits = TileGemmUniversalTraits<
@@ -180,48 +180,23 @@ __device__ __noinline__ void
   block_sync_lds();
 
   // ---- Epilogue: scatter-write results using routing indices ----
-  // (same as moe_linear_mi300.cuh 16x64 tile epilogue)
-  auto &c_buf = c_block_tile.get_thread_buffer();
-
-  index_t warp_id = threadIdx.x >> 6;
-  index_t lane_id = threadIdx.x & 63;
-  index_t tile_row = lane_id & 15;
-  index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-  index_t global_m = m_offset + tile_row;
-  index_t global_n_base = n_offset + tile_col_base;
-
-  if (global_m < BATCH_SIZE) {
-    int const route_val = expert_routing[global_m];
-    if (route_val != 0) {
-      int const topk_slot = route_val - 1;
-
-      if (global_n_base + 3 < OUTPUT_SIZE) {
-        bf16 *out_addr = d_output +
-            global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-            topk_slot * OUTPUT_STRIDE +
-            global_n_base;
-
-        uint64_t out_packed;
-        bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-        out[0] = type_convert<bf16>(c_buf[0]);
-        out[1] = type_convert<bf16>(c_buf[1]);
-        out[2] = type_convert<bf16>(c_buf[2]);
-        out[3] = type_convert<bf16>(c_buf[3]);
-        *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
-      } else if (global_m < BATCH_SIZE) {
-        #pragma unroll
-        for (index_t i = 0; i < 4; i++) {
-          index_t global_n = global_n_base + i;
-          if (global_n < OUTPUT_SIZE) {
-            d_output[global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-                     topk_slot * OUTPUT_STRIDE +
-                     global_n] =
-                type_convert<bf16>(c_buf[i]);
-          }
-        }
+  // Layout-independent: sweeps the C distribution for (row, col).
+  for_each_c_element(c_block_tile, [&](index_t row_in_block,
+                                       index_t col_in_block,
+                                       float val) {
+    index_t global_m = m_offset + row_in_block;
+    index_t global_n = n_offset + col_in_block;
+    if (global_m < BATCH_SIZE && global_n < OUTPUT_SIZE) {
+      int const route_val = expert_routing[global_m];
+      if (route_val != 0) {
+        int const topk_slot = route_val - 1;
+        d_output[global_m * (NUM_TOPK * OUTPUT_STRIDE) +
+                 topk_slot * OUTPUT_STRIDE +
+                 global_n] =
+            type_convert<bf16>(val);
       }
     }
-  }
+  });
 }
 
 // Gang MoE W2 linear: down projection with expert routing.
@@ -263,7 +238,7 @@ __device__ __noinline__ void
 
   using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
   using BlockWarps = sequence<MWarp, NWarp>;
-  using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
+  using WarpTile = sequence<16, 16, 32>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
   using GemmTraits = TileGemmUniversalTraits<
@@ -367,42 +342,21 @@ __device__ __noinline__ void
   block_sync_lds();
 
   // ---- Epilogue: write result for this token ----
-  auto &c_buf = c_block_tile.get_thread_buffer();
-
-  index_t warp_id = threadIdx.x >> 6;
-  index_t lane_id = threadIdx.x & 63;
-  index_t tile_row = lane_id & 15;
-  index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-  index_t global_n_base = n_offset + tile_col_base;
-
-  // Only row 0 has valid data (M=1 GEMM)
-  if (tile_row == 0) {
-    if (global_n_base + 3 < OUTPUT_SIZE) {
-      bf16 *out_addr = d_output +
-          static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
-          static_cast<size_t>(topk_slot) * OUTPUT_STRIDE +
-          global_n_base;
-
-      uint64_t out_packed;
-      bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-      out[0] = type_convert<bf16>(c_buf[0]);
-      out[1] = type_convert<bf16>(c_buf[1]);
-      out[2] = type_convert<bf16>(c_buf[2]);
-      out[3] = type_convert<bf16>(c_buf[3]);
-      *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
-    } else {
-      #pragma unroll
-      for (index_t i = 0; i < 4; i++) {
-        index_t global_n = global_n_base + i;
-        if (global_n < OUTPUT_SIZE) {
-          d_output[static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
-                   static_cast<size_t>(topk_slot) * OUTPUT_STRIDE +
-                   global_n] =
-              type_convert<bf16>(c_buf[i]);
-        }
+  // M=1 GEMM: only row 0 of the block tile holds valid data.
+  // Layout-independent: sweeps the C distribution for (row, col).
+  for_each_c_element(c_block_tile, [&](index_t row_in_block,
+                                       index_t col_in_block,
+                                       float val) {
+    if (row_in_block == 0) {
+      index_t global_n = n_offset + col_in_block;
+      if (global_n < OUTPUT_SIZE) {
+        d_output[static_cast<size_t>(w2_tok) * (NUM_TOPK * OUTPUT_STRIDE) +
+                 static_cast<size_t>(topk_slot) * OUTPUT_STRIDE +
+                 global_n] =
+            type_convert<bf16>(val);
       }
     }
-  }
+  });
 }
 
 } // namespace kernel

@@ -68,11 +68,19 @@ __device__ __forceinline__ unsigned long long int
     ld_nt_u64(unsigned long long int *addr) {
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
   unsigned long long int val;
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   asm volatile(
       "global_load_dwordx2 %0, %1, off nt\n"
       "s_waitcnt vmcnt(0)"
       : "=v"(val) : "v"(addr) : "memory"
   );
+#else
+  asm volatile(
+      "global_load_dwordx2 %0, %1, off\n"
+      "s_waitcnt vmcnt(0)"
+      : "=v"(val) : "v"(addr) : "memory"
+  );
+#endif
   return val;
 #else
   // NVIDIA: use volatile for non-cached access
@@ -84,11 +92,19 @@ __device__ __forceinline__ unsigned long long int
 __device__ __forceinline__ void
     st_nt_u64(unsigned long long int *addr, unsigned long long int val) {
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   asm volatile(
       "global_store_dwordx2 %0, %1, off nt\n"
       "s_waitcnt vmcnt(0)"
       : : "v"(addr), "v"(val) : "memory"
   );
+#else
+  asm volatile(
+      "global_store_dwordx2 %0, %1, off\n"
+      "s_waitcnt vmcnt(0)"
+      : : "v"(addr), "v"(val) : "memory"
+  );
+#endif
 #else
   // NVIDIA: use volatile for non-cached access
   *reinterpret_cast<volatile unsigned long long int*>(addr) = val;
@@ -172,11 +188,19 @@ __device__ __forceinline__ unsigned long long int
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   unsigned long long int old_val;
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   asm volatile(
       "flat_atomic_add_x2 %0, %1, %2 sc0 sc1\n"
       "s_waitcnt vmcnt(0) lgkmcnt(0)"
       : "=v"(old_val) : "v"(addr), "v"(val) : "memory"
   );
+#else
+  asm volatile(
+      "flat_atomic_add_x2 %0, %1, %2 glc\n"
+      "s_waitcnt vmcnt(0) lgkmcnt(0)"
+      : "=v"(old_val) : "v"(addr), "v"(val) : "memory"
+  );
+#endif
   return old_val;
 #else
   unsigned long long int old_val;
@@ -202,11 +226,19 @@ __device__ __forceinline__ unsigned long long int
   cmp_swap[0] = val;  // swap value (low 64 bits) — new value to write
   cmp_swap[1] = cmp;  // compare value (high 64 bits) — expected old value
   unsigned long long int old_val;
+#if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   asm volatile(
       "flat_atomic_cmpswap_x2 %0, %1, %2 sc0 sc1\n"
       "s_waitcnt vmcnt(0) lgkmcnt(0)"
       : "=v"(old_val) : "v"(addr), "v"(cmp_swap) : "memory"
   );
+#else
+  asm volatile(
+      "flat_atomic_cmpswap_x2 %0, %1, %2 glc\n"
+      "s_waitcnt vmcnt(0) lgkmcnt(0)"
+      : "=v"(old_val) : "v"(addr), "v"(cmp_swap) : "memory"
+  );
+#endif
   return old_val;
 #else
   unsigned long long int old_val;
@@ -290,6 +322,10 @@ __device__ __forceinline__ void st_relaxed_gpu_u64(unsigned long long int *addr,
 
 // Memory fence for GPU scope - ensures all previous memory operations are visible
 // Define MPK_DISABLE_THREADFENCE to disable for performance testing
+// ==== MIRAGE HIP COMPAT: 上游在本文件中还定义了第二个同签名的 threadfence_gpu()，
+// 任何编译器都会报重定义；用宏保证全 TU 只编入一处（保留此处实现） ====
+#ifndef MPK_THREADFENCE_GPU_DEFINED
+#define MPK_THREADFENCE_GPU_DEFINED
 __device__ __forceinline__ void threadfence_gpu() {
 #ifdef MPK_DISABLE_THREADFENCE
   // Disabled for performance testing - results may be incorrect
@@ -302,6 +338,8 @@ __device__ __forceinline__ void threadfence_gpu() {
   __threadfence();
 #endif
 }
+#endif
+// ==== end MIRAGE HIP COMPAT ====
 
 // =========================================================================
 // Intra-XCD (same L2 partition) memory operations.
@@ -382,6 +420,10 @@ __device__ __forceinline__ void st_release_sys_i32(int32_t volatile *addr,
 // ---------------------------------------------------------------------------
 // GPU-scope memory fence (used by MPK persistent kernels)
 // ---------------------------------------------------------------------------
+// ==== MIRAGE HIP COMPAT: 上游在本文件中定义了两个同签名的 threadfence_gpu()
+// （L293 与此处），任何编译器都会报重定义。保留前一处，这里用宏跳过 ====
+#ifndef MPK_THREADFENCE_GPU_DEFINED
+#define MPK_THREADFENCE_GPU_DEFINED
 __device__ __forceinline__ void threadfence_gpu() {
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
@@ -389,3 +431,5 @@ __device__ __forceinline__ void threadfence_gpu() {
   __threadfence();
 #endif
 }
+#endif
+// ==== end MIRAGE HIP COMPAT ====

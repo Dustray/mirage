@@ -15,6 +15,14 @@
 
 // MI300 task implementations - clean AMD-only code, no NVIDIA ifdefs
 
+// XCD hierarchy (MI300X gfx940/941/942): hierarchical scheduling, worker_xcd_map
+// startup handshake, two-level event counting, gang XCD dispatch.
+// Non-XCD AMD (gfx936/938) and NVIDIA compile this out and use the flat paths.
+#if (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)) && \
+    (defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__))
+#define MPK_AMD_XCD 1
+#endif
+
 // Generic tasks reused from ampere/ (platform-independent)
 #include "tasks/ampere/embedding.cuh"
 #include "tasks/ampere/identity.cuh"
@@ -27,13 +35,6 @@
 #include "tasks/mi300/silu_mul_mi300.cuh"
 #include "tasks/mi300/silu_mul_linear_mi300.cuh"
 #include "tasks/mi300/linear_mi300.cuh"
-#ifdef MPK_USE_CK_LINEAR
-// Composable Kernel (ck_tile) based GEMM kernels. The kernel names
-// (linear_kernel_ck / linear_kernel_ck_splitk) are distinct from
-// linear_mi300.cuh, so both can be included together; codegen dispatches
-// to the *_ck variants when MPK_USE_CK_LINEAR is set.
-#include "tasks/mi300/linear_ck_mi300.cuh"
-#endif
 #include "tasks/mi300/multitoken_paged_attention_mi300.cuh"
 #include "tasks/mi300/multitoken_paged_attention_split_kv_mi300.cuh"
 #include "tasks/mi300/kv_cache_update_mi300.cuh"

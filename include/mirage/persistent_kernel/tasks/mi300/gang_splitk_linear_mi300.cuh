@@ -56,7 +56,7 @@ __device__ __forceinline__ void gang_splitk_linear_res_kernel(
 
   using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
   using BlockWarps = sequence<1, 4>;  // MWarp=1, NWarp=4
-  using WarpTile = sequence<16, 16, KPerBlock>;
+  using WarpTile = sequence<16, 16, 32>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
   using GemmTraits = TileGemmUniversalTraits<
       true, false, true, false,
@@ -115,29 +115,17 @@ __device__ __forceinline__ void gang_splitk_linear_res_kernel(
     auto c_tile = pipeline(a_win, b_win, NumLoopK, smem);
     block_sync_lds();
 
-    // Atomic epilogue: accumulate partial results to workspace
-    // XCD-local atomics — all workers on same XCD, L2 coherent
-    index_t warp_id = threadIdx.x >> 6;
-    index_t lane_id = threadIdx.x & 63;
-    index_t tile_row = lane_id & 15;
-    index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-    auto& c_buf = c_tile.get_thread_buffer();
-
-    index_t global_m = m_offset + tile_row;
-    if (global_m < BATCH_SIZE && tile_col_base + 3 < NPerBlock) {
-      index_t base = global_m * ws_stride + tile_col_base;
-      atomicAdd(&d_ws[base],     c_buf[0]);
-      atomicAdd(&d_ws[base + 1], c_buf[1]);
-      atomicAdd(&d_ws[base + 2], c_buf[2]);
-      atomicAdd(&d_ws[base + 3], c_buf[3]);
-    } else if (global_m < BATCH_SIZE) {
-      #pragma unroll
-      for (index_t i = 0; i < 4; i++) {
-        if (tile_col_base + i < NPerBlock) {
-          atomicAdd(&d_ws[global_m * ws_stride + tile_col_base + i], c_buf[i]);
-        }
+    // Atomic epilogue: accumulate partial results to workspace.
+    // XCD-local atomics — all workers on same XCD, L2 coherent.
+    // Layout-independent: sweeps the C distribution for (row, col).
+    for_each_c_element(c_tile, [&](index_t row_in_block,
+                                   index_t col_in_block,
+                                   float val) {
+      index_t global_m = m_offset + row_in_block;
+      if (global_m < BATCH_SIZE && col_in_block < NPerBlock) {
+        atomicAdd(&d_ws[global_m * ws_stride + col_in_block], val);
       }
-    }
+    });
   }
 
   // Phase 2: XCD-local done counter (no GPU-scope fence needed!)

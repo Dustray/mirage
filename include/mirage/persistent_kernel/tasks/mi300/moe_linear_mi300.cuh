@@ -73,7 +73,9 @@ __device__ __forceinline__ void
 
   using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
   using BlockWarps = sequence<MWarp, NWarp>;
-  using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
+  using WarpTile = std::conditional_t<use_large_tile,
+                                      sequence<16, 32, 64>,
+                                      sequence<16, 16, 32>>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
   using GemmTraits = TileGemmUniversalTraits<
@@ -199,94 +201,24 @@ __device__ __forceinline__ void
         block_sync_lds();
 
         // ---- Epilogue: scatter-write results using routing indices ----
-        auto &c_buf = c_block_tile.get_thread_buffer();
-
-        index_t warp_id = threadIdx.x >> 6;
-        index_t lane_id = threadIdx.x & 63;
-
-        if constexpr (use_large_tile) {
-          // 32x128 tiles: 32x32 MFMA TransposedCDistribution
-          index_t tile_row = lane_id & 31;
-          index_t m_lane = lane_id >> 5;
-          index_t global_m = m_offset + tile_row;
-
-          if (global_m < BATCH_SIZE) {
-            int const route_val = expert_routing[global_m];
-            if (route_val != 0) {
-              int const topk_slot = route_val - 1;
-              #pragma unroll
-              for (index_t g = 0; g < 4; g++) {
-                index_t col_in_warp = g * 8 + m_lane * 4;
-                index_t global_n_base = n_offset + warp_id * 32 + col_in_warp;
-                index_t r_base = g * 4;
-
-                if (global_n_base + 3 < OUTPUT_SIZE) {
-                  bf16 *out_addr = d_output +
-                      global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-                      topk_slot * OUTPUT_STRIDE +
-                      global_n_base;
-
-                  uint64_t out_packed;
-                  bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-                  out[0] = type_convert<bf16>(c_buf[r_base]);
-                  out[1] = type_convert<bf16>(c_buf[r_base + 1]);
-                  out[2] = type_convert<bf16>(c_buf[r_base + 2]);
-                  out[3] = type_convert<bf16>(c_buf[r_base + 3]);
-                  *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
-                } else {
-                  for (index_t i = 0; i < 4; i++) {
-                    index_t global_n = global_n_base + i;
-                    if (global_n < OUTPUT_SIZE) {
-                      d_output[global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-                               topk_slot * OUTPUT_STRIDE +
-                               global_n] =
-                          type_convert<bf16>(c_buf[r_base + i]);
-                    }
-                  }
-                }
-              }
-            }
-          }
-        } else {
-          // 16x64 tiles: 16x16 MFMA TransposedCDistribution
-          index_t tile_row = lane_id & 15;
-          index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-          index_t global_m = m_offset + tile_row;
-          index_t global_n_base = n_offset + tile_col_base;
-
-          if (global_m < BATCH_SIZE) {
-            int const route_val = expert_routing[global_m];
-            if (route_val != 0) {
-              int const topk_slot = route_val - 1;
-
-              if (global_n_base + 3 < OUTPUT_SIZE) {
-                bf16 *out_addr = d_output +
-                    global_m * (NUM_TOPK * OUTPUT_STRIDE) +
-                    topk_slot * OUTPUT_STRIDE +
-                    global_n_base;
-
-                uint64_t out_packed;
-                bf16 *out = reinterpret_cast<bf16 *>(&out_packed);
-                out[0] = type_convert<bf16>(c_buf[0]);
-                out[1] = type_convert<bf16>(c_buf[1]);
-                out[2] = type_convert<bf16>(c_buf[2]);
-                out[3] = type_convert<bf16>(c_buf[3]);
-                *reinterpret_cast<uint64_t *>(out_addr) = out_packed;
-              } else {
-                #pragma unroll
-                for (index_t i = 0; i < 4; i++) {
-                  index_t global_n = global_n_base + i;
-                  if (global_n < OUTPUT_SIZE) {
+        // Layout-independent: sweeps the C distribution to get (row, col) inside
+        // the block tile, then routes each element to its topk slot.
+        for_each_c_element(c_block_tile, [&](index_t row_in_block,
+                                             index_t col_in_block,
+                                             float val) {
+            index_t global_m = m_offset + row_in_block;
+            index_t global_n = n_offset + col_in_block;
+            if (global_m < BATCH_SIZE && global_n < OUTPUT_SIZE) {
+                int const route_val = expert_routing[global_m];
+                if (route_val != 0) {
+                    int const topk_slot = route_val - 1;
                     d_output[global_m * (NUM_TOPK * OUTPUT_STRIDE) +
                              topk_slot * OUTPUT_STRIDE +
                              global_n] =
-                        type_convert<bf16>(c_buf[i]);
-                  }
+                        type_convert<bf16>(val);
                 }
-              }
             }
-          }
-        }
+        });
         __syncthreads();
       } // n_iter
     }   // m_iter

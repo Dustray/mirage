@@ -48,6 +48,16 @@ using cudaDeviceProp = hipDeviceProp_t;
 using cudaPointerAttributes = hipPointerAttribute_t;
 using cudaDataType_t = hipDataType;
 
+// ==== MIRAGE HIP COMPAT: DTK 26.04 头文件缺少 __nanosleep，补一个近似实现 ====
+__device__ __forceinline__ void __nanosleep(unsigned long long ns) {
+  // s_sleep(1) 的实际时长与频率相关，这里按每条约 1us 粗略逼近
+  while (ns > 1000) {
+    __builtin_amdgcn_s_sleep(1);
+    ns -= 1000;
+  }
+}
+// ==== end MIRAGE HIP COMPAT ====
+
 // cuBLAS/cuDNN library data type constants map 1:1 onto the hipDataType enum
 // values in hip/library_types.h (same numeric encoding as CUDA's
 // library_types.h).
@@ -135,7 +145,16 @@ using cudaDataType_t = hipDataType;
 #define cudaEventRecord hipEventRecord
 #define cudaEventDestroy hipEventDestroy
 
-#define cudaFuncSetAttribute hipFuncSetAttribute
+// ==== MIRAGE HIP COMPAT: 调用点传函数名，HIP 要求 const void*，clang 不做
+// 函数指针到 void* 的隐式转换；模板辅助函数同时兼容函数名与函数指针变量 ====
+template <typename T>
+inline hipError_t
+    mirage_hip_func_set_attr(T func, hipFuncAttribute attr, int value) {
+  return hipFuncSetAttribute(reinterpret_cast<void const *>(func), attr, value);
+}
+#define cudaFuncSetAttribute(func, ...)                                          \
+  mirage_hip_func_set_attr(func, __VA_ARGS__)
+// ==== end MIRAGE HIP COMPAT ====
 #define cudaOccupancyMaxActiveBlocksPerMultiprocessor                             \
   hipOccupancyMaxActiveBlocksPerMultiprocessor
 #define cudaPointerGetAttributes hipPointerGetAttributes
@@ -152,3 +171,20 @@ using cudaDataType_t = hipDataType;
 // entry points used by Mirage device code are provided by
 // hip/hip_runtime_api.h above.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// ==== MIRAGE HIP COMPAT: MFMA builtin 门控绕过 ====
+// DTK 的 gfx936 目标定义漏了 mai-insts 特性，clang 对 __builtin_amdgcn_mfma_*
+// 报 "needs target feature mai-insts"，但汇编器接受 v_mfma 指令（硬件支持，
+// CK 内部也是走汇编）。用语句表达式 + inline asm 提供等价实现，任务代码与
+// 调用点（modifier 均为 0,0,0）无需改动；auto 拷贝可兼容实参为左值时
+// decltype 退化成引用的问题 ====
+#define __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a, b, c, ...)                  \
+  __extension__({                                                                \
+    auto mirage_mfma_d_ = (c);                                                   \
+    asm("v_mfma_f32_16x16x16_bf16_1k %0, %1, %2, %3, 0, 0"                       \
+        : "=v"(mirage_mfma_d_)                                                   \
+        : "v"(a), "v"(b), "v"(c));                                               \
+    mirage_mfma_d_;                                                              \
+  })
+// ==== end MIRAGE HIP COMPAT ====

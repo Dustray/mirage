@@ -470,20 +470,21 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+          c_vec = mmac_16x16x16_bf16(a_vec, b_vec, c_vec);
           acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
         }
 
         // Store scores with causal masking — directly to s_scores (no init needed)
         // CRITICAL: Use global_seq_len for causal mask position
-        int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
-        int out_col = tile_n * MFMA_N + (lane % 16);
+        // MMAC C-layout: c_vec[r] = C[m=lane%16][n=4*r+lane/16]
+        int out_row = tile_m * MFMA_M + (lane % 16);
+        int out_col_base = tile_n * MFMA_N + (lane / 16);
 
-        if (out_col < curr_iter_len) {
+        if (out_row < q_rows) {
           #pragma unroll
           for (int r = 0; r < 4; r++) {
-            int out_row = out_row_base + r;
-            if (out_row < q_rows) {
+            int out_col = out_col_base + 4 * r;
+            if (out_col < curr_iter_len) {
               int token_idx = out_row / NUM_QO_PER_KV;
               int q_pos = global_seq_len - num_tokens + token_idx;
               int kv_pos = tile_start + out_col;  // tile_start is global
@@ -496,11 +497,11 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           }
         }
         // Write -INFINITY for out-of-bounds columns (padding)
-        if (out_col >= curr_iter_len && out_col < KV_TILE_SIZE) {
+        if (out_row < q_rows) {
           #pragma unroll
           for (int r = 0; r < 4; r++) {
-            int out_row = out_row_base + r;
-            if (out_row < q_rows) {
+            int out_col = out_col_base + 4 * r;
+            if (out_col >= curr_iter_len && out_col < KV_TILE_SIZE) {
               s_scores[out_row * KV_TILE_SIZE + out_col] = -INFINITY;
             }
           }
@@ -658,17 +659,18 @@ __device__ __forceinline__ void multitoken_paged_attention_ck_split_kv(
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+          c_vec = mmac_16x16x16_bf16(a_vec, b_vec, c_vec);
           acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
         }
 
         // Accumulate to output
-        int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
-        int out_col = out_tile * MFMA_N + (lane % 16);
+        // MMAC C-layout: c_vec[r] = C[m=lane%16][n=4*r+lane/16]
+        int out_row = tile_m * MFMA_M + (lane % 16);
+        int out_col_base = out_tile * MFMA_N + (lane / 16);
 
         #pragma unroll
         for (int r = 0; r < 4; r++) {
-          int out_row = out_row_base + r;
+          int out_col = out_col_base + 4 * r;
           if (out_row < q_rows && out_col < HEAD_DIM) {
             s_o[out_row * HEAD_DIM + out_col] += acc[r];
           }

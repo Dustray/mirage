@@ -389,8 +389,8 @@ __device__ __noinline__ void gang_linear_silu_kernel(
   int gate_weight_tile = grp * 4 + sub;
   int up_weight_tile = grp * 4 + 2 + sub;
 
-  // Tile selection: large batch → 64×64×128 (32×32 MFMA, 2×2 warps)
-  //                 small batch → 16×64×256 (16×16 MFMA, 1×4 warps)
+  // Tile selection: large batch → 64×64×128 (MMAC 16x32x64, 2×2 warps)
+  //                 small batch → 16×64×256 (MMAC 16x16x32, 1×4 warps)
   constexpr bool use_large_tile = (BATCH_SIZE >= 32);
   constexpr index_t MPerBlock = use_large_tile ? 64 : 16;
   constexpr index_t NPerBlock = 64;
@@ -400,8 +400,9 @@ __device__ __noinline__ void gang_linear_silu_kernel(
 
   using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
   using BlockWarps = std::conditional_t<use_large_tile, sequence<2, 2>, sequence<1, 4>>;
-  constexpr index_t WarpMN = use_large_tile ? 32 : 16;
-  using WarpTile = sequence<WarpMN, WarpMN, 16>;
+  using WarpTile = std::conditional_t<use_large_tile,
+                                      sequence<16, 32, 64>,
+                                      sequence<16, 16, 32>>;
   using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
   using GemmTraits = TileGemmUniversalTraits<
       true, false, true, false,
@@ -429,16 +430,13 @@ __device__ __noinline__ void gang_linear_silu_kernel(
   int o_stride_u = __builtin_amdgcn_readfirstlane(o_stride);
 
   extern __shared__ char smem[];
-  // LDS scratch for SiLU results: 256 threads × N_REGS floats
-  // Placed after CK pipeline's smem (which it reuses between gate and up GEMMs)
+  // LDS scratch for SiLU results, keyed by (row_in_block, col) so gate/up GEMMs
+  // share a layout-independent buffer (no dependence on warp gemm C layout).
   constexpr int CK_SMEM_SIZE = PipelinePolicy::template GetSmemSize<Problem>();
-  // For 64×64: 16 regs/thread. For 16×64: 4 regs/thread.
-  constexpr int N_REGS = use_large_tile ? 16 : 4;
   float* silu_scratch = reinterpret_cast<float*>(smem + CK_SMEM_SIZE);
 
   index_t warp_id = threadIdx.x >> 6;
   index_t lane_id = threadIdx.x & 63;
-  index_t silu_base = threadIdx.x * N_REGS;
 
   // Weight views are constant across M-iterations (weight reuse in L2)
 #ifdef MPK_NT_WEIGHT_LOADS
@@ -489,13 +487,13 @@ __device__ __noinline__ void gang_linear_silu_kernel(
       auto c_gate = pipeline(a_win, b_gate_win, NumLoopK, smem);
       block_sync_lds();
 
-      // Apply SiLU to gate results and store to LDS scratch
-      auto& gate_buf = c_gate.get_thread_buffer();
-      #pragma unroll
-      for (index_t i = 0; i < N_REGS; i++) {
-        float g = gate_buf[i];
-        silu_scratch[silu_base + i] = g / (1.0f + __expf(-g));  // SiLU
-      }
+      // Apply SiLU to gate results and store to LDS scratch (layout-independent)
+      for_each_c_element(c_gate, [&](index_t row_in_block,
+                                     index_t col_in_block,
+                                     float g) {
+        float silu_g = g / (1.0f + __expf(-g));
+        silu_scratch[row_in_block * NPerBlock + col_in_block] = silu_g;
+      });
     }
     __syncthreads();
 
@@ -513,63 +511,19 @@ __device__ __noinline__ void gang_linear_silu_kernel(
       auto c_up = pipeline(a_win, b_up_win, NumLoopK, smem);
       block_sync_lds();
 
-      // Multiply up result by SiLU(gate) from LDS and write to output
-      auto& up_buf = c_up.get_thread_buffer();
-
-      if constexpr (use_large_tile) {
-        // 64×64 tile: 32×32 MFMA, MWarp=2 NWarp=2, 16 regs/thread
-        // Row = warp_m * 32 + (lane_id % 32)
-        // Col groups of 4: warp_n * 32 + (g*8 + (lane_id/32)*4)
-        index_t warp_m = warp_id >> 1;
-        index_t warp_n = warp_id & 1;
-        index_t tile_row = lane_id & 31;
-        index_t m_lane = lane_id >> 5;
-        index_t global_m = warp_m * 32 + tile_row + m_offset;
-
-        if (global_m < BATCH_SIZE) {
-          #pragma unroll
-          for (index_t g = 0; g < 4; g++) {
-            index_t col_in_warp = g * 8 + m_lane * 4;
-            index_t global_n = warp_n * 32 + col_in_warp;
-            index_t r_base = g * 4;
-
-            if (global_n + 3 < NPerBlock) {
-              index_t out_idx = (warp_m * 32 + tile_row) * o_stride_u + global_n;
-              uint64_t out_packed;
-              bf16* out = reinterpret_cast<bf16*>(&out_packed);
-              #pragma unroll
-              for (index_t i = 0; i < 4; i++) {
-                out[i] = type_convert<bf16>(silu_scratch[silu_base + r_base + i] * up_buf[r_base + i]);
-              }
-              nt_store_u64(&d_output[out_idx], out_packed);
-            }
-          }
+      // Multiply up result by SiLU(gate) from LDS and write to output.
+      // Layout-independent: sweeps the C distribution for (row, col).
+      for_each_c_element(c_up, [&](index_t row_in_block,
+                                   index_t col_in_block,
+                                   float up_val) {
+        index_t global_m = m_offset + row_in_block;
+        if (global_m < BATCH_SIZE && col_in_block < NPerBlock) {
+          float silu_g = silu_scratch[row_in_block * NPerBlock + col_in_block];
+          float val = silu_g * up_val;
+          nt_store_bf16(&d_output[global_m * o_stride_u + col_in_block],
+                        type_convert<bf16>(val));
         }
-      } else {
-        // 16×64 tile: 16×16 MFMA, MWarp=1 NWarp=4, 4 regs/thread
-        index_t tile_row = lane_id & 15;
-        index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-
-        if (tile_row + m_offset < BATCH_SIZE && tile_col_base + 3 < NPerBlock) {
-          index_t out_idx = tile_row * o_stride_u + tile_col_base;
-          uint64_t out_packed;
-          bf16* out = reinterpret_cast<bf16*>(&out_packed);
-          #pragma unroll
-          for (index_t i = 0; i < 4; i++) {
-            out[i] = type_convert<bf16>(silu_scratch[silu_base + i] * up_buf[i]);
-          }
-          nt_store_u64(&d_output[out_idx], out_packed);
-        } else if (tile_row + m_offset < BATCH_SIZE) {
-          #pragma unroll
-          for (index_t i = 0; i < 4; i++) {
-            index_t col = tile_col_base + i;
-            if (col < NPerBlock) {
-              float val = silu_scratch[silu_base + i] * up_buf[i];
-              nt_store_bf16(&d_output[tile_row * o_stride_u + col], type_convert<bf16>(val));
-            }
-          }
-        }
-      }
+      });
     }
     __syncthreads();  // Barrier before next M-iteration reuses silu_scratch
   }

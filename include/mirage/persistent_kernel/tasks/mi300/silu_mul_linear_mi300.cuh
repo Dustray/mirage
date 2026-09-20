@@ -85,8 +85,6 @@ silu_mul_linear_task_impl(void const *input_ptr,
     constexpr index_t MIterPerWarp = MPerBlock / (MWarp * WG::kM);
     constexpr index_t NIterPerWarp = NPerBlock / (NWarp * WG::kN);
     constexpr index_t KIterPerWarp = KPerBlock / WG::kK;
-
-    // A register distribution for GEMM (must match BlockGemmARegBRegCRegV1's expectation)
     constexpr auto a_outer_enc = tile_distribution_encoding<
         sequence<NWarp>,
         tuple<sequence<MIterPerWarp, MWarp>, sequence<KIterPerWarp>>,
@@ -376,68 +374,44 @@ silu_mul_linear_task_impl(void const *input_ptr,
                 block_gemm(c_block_tile, a_reg1, b_reg1);
             }
 
-            // === Epilogue (identical to linear_kernel_ck) ===
+            // === Epilogue: store GEMM results via CK store_tile ===
+            // MMAC C register layout is encoded in CWarpDstrEncoding, so store_tile
+            // writes the [MPerBlock, NPerBlock] accumulator tile correctly. Residual
+            // is accumulated into the float32 accumulator before the bf16 store.
             {
-                index_t warp_id = threadIdx.x >> 6;
-                index_t lane_id = threadIdx.x & 63;
-                index_t tile_row = lane_id & 15;
-                index_t tile_col_base =
-                    warp_id * 16 + ((lane_id >> 4) << 2);
+                auto out_view = make_naive_tensor_view<address_space_enum::global>(
+                    d_output + m_offset * O_STRIDE + n_offset,
+                    make_tuple(m_size, n_size),
+                    make_tuple(index_t(O_STRIDE), index_t(1)),
+                    number<8>{},
+                    number<1>{});
+                auto out_window = make_tile_window(
+                    out_view,
+                    make_tuple(number<MPerBlock>{}, number<NPerBlock>{}),
+                    {0, 0});
 
-                auto& c_buf = c_block_tile.get_thread_buffer();
-
-                index_t global_m = m_offset + tile_row;
-                index_t global_n_base = n_offset + tile_col_base;
-
-                if (global_m < BATCH_SIZE &&
-                    global_n_base + 3 < OUTPUT_SIZE) {
-                    index_t out_base =
-                        global_m * O_STRIDE + global_n_base;
-                    if (residual_add && d_residual != nullptr) {
-                        uint64_t res_packed =
-                            *reinterpret_cast<const uint64_t*>(
-                                &d_residual[out_base]);
-                        const bf16* res =
-                            reinterpret_cast<const bf16*>(&res_packed);
-                        uint64_t out_packed;
-                        bf16* out =
-                            reinterpret_cast<bf16*>(&out_packed);
-                        out[0] = type_convert<bf16>(
-                            c_buf[0] + type_convert<float>(res[0]));
-                        out[1] = type_convert<bf16>(
-                            c_buf[1] + type_convert<float>(res[1]));
-                        out[2] = type_convert<bf16>(
-                            c_buf[2] + type_convert<float>(res[2]));
-                        out[3] = type_convert<bf16>(
-                            c_buf[3] + type_convert<float>(res[3]));
-                        nt_store_u64(&d_output[out_base], out_packed);
-                    } else {
-                        uint64_t out_packed;
-                        bf16* out =
-                            reinterpret_cast<bf16*>(&out_packed);
-                        out[0] = type_convert<bf16>(c_buf[0]);
-                        out[1] = type_convert<bf16>(c_buf[1]);
-                        out[2] = type_convert<bf16>(c_buf[2]);
-                        out[3] = type_convert<bf16>(c_buf[3]);
-                        nt_store_u64(&d_output[out_base], out_packed);
-                    }
-                } else if (global_m < BATCH_SIZE) {
-                    #pragma unroll
-                    for (index_t i = 0; i < 4; i++) {
-                        index_t global_n = global_n_base + i;
-                        if (global_n < OUTPUT_SIZE) {
-                            float val = c_buf[i];
-                            if (residual_add &&
-                                d_residual != nullptr) {
-                                val += type_convert<float>(
-                                    d_residual[global_m * O_STRIDE +
-                                               global_n]);
-                            }
-                            nt_store_bf16(&d_output[global_m * O_STRIDE + global_n],
-                                type_convert<bf16>(val));
-                        }
-                    }
+                if (residual_add && d_residual != nullptr) {
+                    auto res_view = make_naive_tensor_view<address_space_enum::global>(
+                        d_residual + m_offset * O_STRIDE + n_offset,
+                        make_tuple(m_size, n_size),
+                        make_tuple(index_t(O_STRIDE), index_t(1)),
+                        number<8>{},
+                        number<1>{});
+                    // Residual must be loaded with the SAME tile distribution as the
+                    // accumulator so tile_elementwise_inout operates element-wise.
+                    auto res_window = make_tile_window(
+                        res_view,
+                        make_tuple(number<MPerBlock>{}, number<NPerBlock>{}),
+                        {0, 0},
+                        c_block_tile.get_tile_distribution());
+                    auto res_tile = load_tile(res_window);
+                    tile_elementwise_inout(
+                        [](auto& c, const auto& r) {
+                            c += type_convert<float>(r);
+                        },
+                        c_block_tile, res_tile);
                 }
+                store_tile(out_window, cast_tile<bf16>(c_block_tile));
             }
         }
     }

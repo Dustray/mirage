@@ -46,6 +46,37 @@ __device__ __forceinline__ void nt_store_bf16(ck_tile::bf16_t* addr, ck_tile::bf
 
 using bf16 = ck_tile::bf16_t;
 
+// ============================================================================
+// Layout-independent traversal of a CK distributed C tile.
+// Sweeps every distributed element of the block accumulator and calls
+//   fn(row_within_block, col_within_block, value)
+// where (row_within_block, col_within_block) are coordinates inside the
+// [MPerBlock, NPerBlock] block tile (NOT the global [M, N] position), and
+// value is the float32 accumulator element held by the current thread.
+// This is independent of the warp gemm C register layout (MFMA or MMAC), so
+// atomic/scatter epilogues no longer need hand-coded lane/register mappings.
+// ============================================================================
+template <typename CBlockTile, typename F>
+CK_TILE_DEVICE void for_each_c_element(CBlockTile& c_block_tile, F&& fn)
+{
+    using CBlockTileT = ck_tile::remove_cvref_t<CBlockTile>;
+    using TileDstr    = typename CBlockTileT::StaticTileDistribution;
+
+    constexpr auto tile_dstr = TileDstr{};
+
+    // Traverse every distributed index of the 2D [M, N] block tile.
+    ck_tile::sweep_tile<CBlockTileT>([&](auto idx) {
+        constexpr auto distributed_indices = ck_tile::make_tuple(
+            idx[ck_tile::number<0>{}], idx[ck_tile::number<1>{}]);
+        const auto x_indices =
+            ck_tile::get_x_indices_from_distributed_indices(tile_dstr, distributed_indices);
+        const ck_tile::index_t row = x_indices[ck_tile::number<0>{}];
+        const ck_tile::index_t col = x_indices[ck_tile::number<1>{}];
+        fn(row, col, c_block_tile(distributed_indices));
+    });
+}
+
+
 // Promote a device pointer to wave-uniform (SGPR) representation.
 // On AMDGPU, buffer_load requires the base address in an SGPR buffer resource
 // descriptor. When the compiler cannot prove a pointer is uniform across the
@@ -61,57 +92,58 @@ __device__ __forceinline__ uintptr_t __uniform_addr(const void* ptr) {
 }
 
 // ============================================================================
-// Custom block gemm policy for small batch sizes using 16x16x16 MFMA
+// Custom block gemm policy for small batch sizes using MMAC (gfx938/DCU)
 // Uses MWarp=1, NWarp=4 configuration to allow MPerBlock=16, NPerBlock=64
 // This minimizes padding overhead for small batches (batch_size=8 -> 2x padding)
+// MMAC bf16 warp tile is fixed at kM=16 (16x16x32 for the small tile).
 // ============================================================================
 struct BlockGemmSmallM16Policy
 {
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto GetWarpGemmMWarpNWarp()
     {
-        // Use 16x16x32 MFMA with transposed C distribution (MI350 2x K)
+        // Use 16x16x32 MMAC with transposed C distribution
         // MWarp=1 allows MPerBlock=16 (minimal padding for batch=8)
-        // NWarp=4 to maintain parallelism across 4 warps (128 threads)
+        // NWarp=4 to maintain parallelism across 4 warps (256 threads)
         return ck_tile::make_tuple(
-            ck_tile::WarpGemmMfmaBf16Bf16F32M16N16K32TransposedCDistribution{},
+            ck_tile::WarpGemmMmacBF16BF16F32_WT16x16x32_MR1NR1MI1NI1_TRANSC{},
             1,  // MWarp = 1 -> MPerBlock >= 16
             4   // NWarp = 4 -> NPerBlock >= 64
         );
     }
 };
 
-// Default block gemm policy using 32x32x16 MFMA (same as CK default)
-// MWarp=4, NWarp=1 -> MPerBlock=128, NPerBlock=32
+// Default block gemm policy using 16x32x64 MMAC
+// MWarp=2, NWarp=2 -> MPerBlock=128, NPerBlock=64 (with MIter/NIter)
 struct BlockGemmDefaultPolicy
 {
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto GetWarpGemmMWarpNWarp()
     {
         return ck_tile::make_tuple(
-            ck_tile::WarpGemmMfmaBf16Bf16F32M32N32K16TransposedCDistribution<>{},
-            4,  // MWarp
-            1   // NWarp
+            ck_tile::WarpGemmMmacBF16BF16F32_WT16x32x64_MR1NR2MI1NI1_TRANSC{},
+            2,  // MWarp
+            2   // NWarp
         );
     }
 };
 
-// 2x2 warp grid policy using 32x32x16 MFMA
-// MWarp=2, NWarp=2 -> MPerBlock=64, NPerBlock=64 (or 64x128 with NIter=2)
+// 2x2 warp grid policy using 16x32x64 MMAC
+// MWarp=2, NWarp=2 -> MPerBlock=64, NPerBlock=64 (MIter=2, NIter=1)
 struct BlockGemm2x2Policy
 {
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto GetWarpGemmMWarpNWarp()
     {
         return ck_tile::make_tuple(
-            ck_tile::WarpGemmMfmaBf16Bf16F32M32N32K16TransposedCDistribution<>{},
-            2,  // MWarp = 2 -> M = 2 * 32 * MIter
+            ck_tile::WarpGemmMmacBF16BF16F32_WT16x32x64_MR1NR2MI1NI1_TRANSC{},
+            2,  // MWarp = 2 -> M = 2 * 16 * MIter
             2   // NWarp = 2 -> N = 2 * 32 * NIter
         );
     }
 };
 
-// Large tile policy for bigger batch sizes using 32x32x16 MFMA
+// Large tile policy for bigger batch sizes using 16x32x64 MMAC
 // MWarp=1, NWarp=4 -> MPerBlock=32, NPerBlock=128
 struct BlockGemmLargeM32Policy
 {
@@ -119,9 +151,9 @@ struct BlockGemmLargeM32Policy
     CK_TILE_HOST_DEVICE static constexpr auto GetWarpGemmMWarpNWarp()
     {
         return ck_tile::make_tuple(
-            ck_tile::WarpGemmMfmaBf16Bf16F32M32N32K16TransposedCDistribution<>{},
-            1,  // MWarp = 1 -> MPerBlock = 32
-            4   // NWarp = 4 -> NPerBlock = 128
+            ck_tile::WarpGemmMmacBF16BF16F32_WT16x32x64_MR1NR2MI1NI1_TRANSC{},
+            1,  // MWarp = 1 -> MPerBlock = 32 (MIter=2)
+            4   // NWarp = 4 -> NPerBlock = 128 (NIter=1)
         );
     }
 };
@@ -258,22 +290,27 @@ struct GemmPipelineSmallTilePolicy
                                        sequence<0, 1>>{});
     }
 
-    // Use small-batch optimized block gemm policy
+    // Use small-batch optimized block gemm policy.
+    // NOTE: use the MMAC-dedicated MmacBlockGemmASmemBSmemCRegV1 (self-contained:
+    // loads A/B warp tiles from LDS inside operator(), no external LocalPrefetch
+    // required). The generic BlockUniversalGemmAsBsCr Intrawave variant relies on
+    // a LocalPrefetch that the v2 pipeline never calls, which left A/B warp tiles
+    // all-zero on DCU (gfx936/gfx938) and produced all-zero GEMM outputs.
     template <typename Problem>
     CK_TILE_HOST_DEVICE static constexpr auto GetBlockGemm()
     {
         if constexpr (MPerBlock == 16) {
-            // Use 16x16 MFMA for small M tiles
-            return ck_tile::BlockUniversalGemmAsBsCr<Problem, BlockGemmSmallM16Policy>{};
+            // Use 16x16 MMAC for small M tiles
+            return ck_tile::MmacBlockGemmASmemBSmemCRegV1<Problem, BlockGemmSmallM16Policy>{};
         } else if constexpr (MPerBlock == 64) {
-            // Use 32x32 MFMA with 2x2 warp grid for full-batch M=64 tiles
-            return ck_tile::BlockUniversalGemmAsBsCr<Problem, BlockGemm2x2Policy>{};
+            // Use 16x32 MMAC with 2x2 warp grid for full-batch M=64 tiles
+            return ck_tile::MmacBlockGemmASmemBSmemCRegV1<Problem, BlockGemm2x2Policy>{};
         } else if constexpr (MPerBlock == 32 && NPerBlock == 128) {
-            // Use 32x32 MFMA for larger batch sizes
-            return ck_tile::BlockUniversalGemmAsBsCr<Problem, BlockGemmLargeM32Policy>{};
+            // Use 16x32 MMAC for larger batch sizes
+            return ck_tile::MmacBlockGemmASmemBSmemCRegV1<Problem, BlockGemmLargeM32Policy>{};
         } else {
-            // Use default 32x32 MFMA for other configurations
-            return ck_tile::BlockUniversalGemmAsBsCr<Problem, BlockGemmDefaultPolicy>{};
+            // Use default 16x32 MMAC for other configurations
+            return ck_tile::MmacBlockGemmASmemBSmemCRegV1<Problem, BlockGemmDefaultPolicy>{};
         }
     }
 };
@@ -304,9 +341,9 @@ __device__ __forceinline__ void linear_kernel_ck(void const *input_ptr,
     using namespace ck_tile;
 
     // Four-tier tile selection:
-    //   Tier 0 (small):  16x64x256,  16x16 MFMA, MWarp=1 NWarp=4 (bs<=16)
-    //   Tier 1 (medium): 64x64x128,  32x32 MFMA, MWarp=2 NWarp=2 (17<=bs<=64)
-    //   Tier 2 (large):  128x128x64, 32x32 MFMA, MWarp=2 NWarp=2 (bs>64)
+    //   Tier 0 (small):  16x64x256,  MMAC 16x16x32, MWarp=1 NWarp=4 (bs<=16)
+    //   Tier 1 (medium): 64x64x128,  MMAC 16x32x64, MWarp=2 NWarp=2 (17<=bs<=64)
+    //   Tier 2 (large):  128x128x64, MMAC 16x32x64, MWarp=2 NWarp=2 (bs>64)
     constexpr bool use_xlarge_tile = !FORCE_SMALL_TILE && (BATCH_SIZE > 64);
     constexpr bool use_medium_tile = !FORCE_SMALL_TILE && (BATCH_SIZE > 16) && !use_xlarge_tile;
 
@@ -324,16 +361,17 @@ __device__ __forceinline__ void linear_kernel_ck(void const *input_ptr,
 
     using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
     using BlockWarps = sequence<MWarp, NWarp>;
-    // WarpTile = MFMA dimensions (32x32x16 or 16x16x16), NOT the iterated tile.
+    // WarpTile = MMAC warp tile dimensions (16x16x32 or 16x32x64), NOT the iterated tile.
     // MIterPerWarp/NIterPerWarp are computed automatically by BlockUniversalGemmAsBsCr.
-    constexpr index_t WarpM = (use_xlarge_tile || use_medium_tile) ? 32 : 16;
+    constexpr index_t WarpM = 16;   // MMAC bf16 warp tile kM is fixed at 16
     constexpr index_t WarpN = (use_xlarge_tile || use_medium_tile) ? 32 : 16;
-    constexpr index_t WarpK = (use_xlarge_tile || use_medium_tile) ? 16 : 32;  // MI350: K=32 for small tile
+    constexpr index_t WarpK = (use_xlarge_tile || use_medium_tile) ? 64 : 32;
     using WarpTile = sequence<WarpM, WarpN, WarpK>;
 
     using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
 
-    // Define traits — 128x128 uses TransposeC=true for CK default policy compatibility
+    // Define traits — TransposeC no longer affects the MMAC block gemm (store_tile epilogue
+    // follows the CWarpDstr encoding directly), so keep it uniform for all tiles.
     using GemmTraits = TileGemmUniversalTraits<
         true,   // kPadM
         false,  // kPadN
@@ -342,16 +380,13 @@ __device__ __forceinline__ void linear_kernel_ck(void const *input_ptr,
         tensor_layout::gemm::RowMajor,
         tensor_layout::gemm::ColumnMajor,
         tensor_layout::gemm::RowMajor,
-        use_xlarge_tile  // TransposeC: true for 128x128 (default policy), false for smaller
+        false   // TransposeC: irrelevant for MMAC path
     >;
 
     using Problem = GemmPipelineProblem<bf16, bf16, float, GemmShape, GemmTraits>;
 
-    // For 128x128 tiles, use CK default policy (handles MIterPerWarp=2, NIterPerWarp=2).
-    // For smaller tiles, use custom policy.
-    using PipelinePolicy = std::conditional_t<use_xlarge_tile,
-        GemmPipelineAGmemBGmemCRegV1DefaultPolicy,
-        GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>>;
+    // All tiles use the custom MMAC-capable policy (default policy hard-codes MWarp=1/NWarp=1).
+    using PipelinePolicy = GemmPipelineSmallTilePolicy<MPerBlock, NPerBlock, KPerBlock>;
     using Pipeline = GemmPipelineAGmemBGmemCRegV2<Problem, PipelinePolicy>;
 
     // Promote pointers and runtime dims to wave-uniform (SGPR) to eliminate
@@ -430,189 +465,44 @@ __device__ __forceinline__ void linear_kernel_ck(void const *input_ptr,
 
             block_sync_lds();
 
-            // Epilogue: write GEMM results to global memory
-            // Use CK store_tile for 128x128 (complex C distribution with MIter/NIter),
-            // hand-written epilogues for smaller tiles (known register layout).
-            if constexpr (use_xlarge_tile) {
-                // 128x128 tiles: 32x32 MFMA TransposedCDistribution
-                // MWarp=2, NWarp=2 with MIterPerWarp=2, NIterPerWarp=2
-                // Each thread has 64 float32 registers (4 MFMA tiles × 16 regs each).
-                //
-                // Register layout per MFMA tile (32x32 TransposedC):
-                //   Row within tile: lane_id % 32
-                //   Col within tile: (r/4)*8 + (lane_id/32)*4 + (r%4), r=0..15
-                //
-                // Global position:
-                //   warp_m = warp_id / 2, warp_n = warp_id % 2
-                //   For (mIter, nIter) in {0,1}×{0,1}:
-                //     M_base = warp_m * 64 + mIter * 32
-                //     N_base = warp_n * 64 + nIter * 32
-                //     reg_offset = (mIter * 2 + nIter) * 16
-                index_t warp_id = threadIdx.x >> 6;
-                index_t lane_id = threadIdx.x & 63;
-                index_t tile_row_in_mfma = lane_id & 31;
-                index_t m_lane = lane_id >> 5;
-                index_t warp_m = warp_id >> 1;
-                index_t warp_n = warp_id & 1;
+            // Epilogue: write GEMM results to global memory via CK store_tile.
+            // The MMAC C register layout (kCMLane=4/kCNLane=16, MR/NR repeats) is encoded in
+            // CWarpDstrEncoding, so store_tile writes it out correctly regardless of warp tile.
+            // Residual is accumulated into the float32 accumulator before the bf16 store.
+            {
+                auto out_view = make_naive_tensor_view<address_space_enum::global>(
+                    d_output + m_offset * o_stride + n_offset,
+                    make_tuple(m_size, n_size),
+                    make_tuple(index_t(o_stride), index_t(1)),
+                    number<8>{},
+                    number<1>{});
+                auto out_window = make_tile_window(
+                    out_view,
+                    make_tuple(number<MPerBlock>{}, number<NPerBlock>{}),
+                    {0, 0});
 
-                auto& c_buf = c_block_tile.get_thread_buffer();
-
-                #pragma unroll
-                for (index_t mIter = 0; mIter < 2; mIter++) {
-                    index_t base_m = m_offset + warp_m * 64 + mIter * 32 + tile_row_in_mfma;
-                    if (base_m >= BATCH_SIZE) continue;
-
-                    #pragma unroll
-                    for (index_t nIter = 0; nIter < 2; nIter++) {
-                        index_t r_offset = (mIter * 2 + nIter) * 16;
-                        index_t base_n = n_offset + warp_n * 64 + nIter * 32;
-
-                        #pragma unroll
-                        for (index_t g = 0; g < 4; g++) {
-                            index_t col_in_mfma = g * 8 + m_lane * 4;
-                            index_t global_n_base = base_n + col_in_mfma;
-                            index_t r_base = r_offset + g * 4;
-
-                            if (global_n_base + 3 < output_size) {
-                                index_t out_base = base_m * o_stride + global_n_base;
-                                if (residual_add && d_residual != nullptr) {
-                                    uint64_t res_packed = *reinterpret_cast<const uint64_t*>(&d_residual[out_base]);
-                                    const bf16* res = reinterpret_cast<const bf16*>(&res_packed);
-                                    uint64_t out_packed;
-                                    bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                                    out[0] = type_convert<bf16>(c_buf[r_base]   + type_convert<float>(res[0]));
-                                    out[1] = type_convert<bf16>(c_buf[r_base+1] + type_convert<float>(res[1]));
-                                    out[2] = type_convert<bf16>(c_buf[r_base+2] + type_convert<float>(res[2]));
-                                    out[3] = type_convert<bf16>(c_buf[r_base+3] + type_convert<float>(res[3]));
-                                    nt_store_u64(&d_output[out_base], out_packed);
-                                } else {
-                                    uint64_t out_packed;
-                                    bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                                    out[0] = type_convert<bf16>(c_buf[r_base]);
-                                    out[1] = type_convert<bf16>(c_buf[r_base+1]);
-                                    out[2] = type_convert<bf16>(c_buf[r_base+2]);
-                                    out[3] = type_convert<bf16>(c_buf[r_base+3]);
-                                    nt_store_u64(&d_output[out_base], out_packed);
-                                }
-                            } else {
-                                for (index_t i = 0; i < 4; i++) {
-                                    index_t global_n = global_n_base + i;
-                                    if (global_n < output_size) {
-                                        float val = c_buf[r_base + i];
-                                        if (residual_add && d_residual != nullptr)
-                                            val += type_convert<float>(d_residual[base_m * o_stride + global_n]);
-                                        nt_store_bf16(&d_output[base_m * o_stride + global_n], type_convert<bf16>(val));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                if (residual_add && d_residual != nullptr) {
+                    auto res_view = make_naive_tensor_view<address_space_enum::global>(
+                        d_residual + m_offset * o_stride + n_offset,
+                        make_tuple(m_size, n_size),
+                        make_tuple(index_t(o_stride), index_t(1)),
+                        number<8>{},
+                        number<1>{});
+                    // Residual must be loaded with the SAME tile distribution as the
+                    // accumulator so tile_elementwise_inout operates element-wise.
+                    auto res_window = make_tile_window(
+                        res_view,
+                        make_tuple(number<MPerBlock>{}, number<NPerBlock>{}),
+                        {0, 0},
+                        c_block_tile.get_tile_distribution());
+                    auto res_tile = load_tile(res_window);
+                    tile_elementwise_inout(
+                        [](auto& c, const auto& r) {
+                            c += type_convert<float>(r);
+                        },
+                        c_block_tile, res_tile);
                 }
-            } else if constexpr (use_medium_tile) {
-                // 64x64 tiles: 32x32 MFMA TransposedCDistribution
-                // MWarp=2, NWarp=2, MIterPerWarp=1, NIterPerWarp=1
-                // Each thread has 16 float32 registers.
-                // warp_m = warp_id / 2, warp_n = warp_id % 2
-                // Row = warp_m * 32 + (lane_id % 32)
-                // Col = warp_n * 32 + (g*8 + (lane_id/32)*4 + r%4)
-                index_t warp_id = threadIdx.x >> 6;
-                index_t lane_id = threadIdx.x & 63;
-                index_t warp_m = warp_id >> 1;
-                index_t warp_n = warp_id & 1;
-                index_t tile_row = lane_id & 31;
-                index_t m_lane = lane_id >> 5;
-
-                auto& c_buf = c_block_tile.get_thread_buffer();
-                index_t global_m = m_offset + warp_m * 32 + tile_row;
-
-                if (global_m < BATCH_SIZE) {
-                    #pragma unroll
-                    for (index_t g = 0; g < 4; g++) {
-                        index_t col_in_warp = g * 8 + m_lane * 4;
-                        index_t global_n_base = n_offset + warp_n * 32 + col_in_warp;
-                        index_t r_base = g * 4;
-
-                        if (global_n_base + 3 < output_size) {
-                            index_t out_base = global_m * o_stride + global_n_base;
-                            if (residual_add && d_residual != nullptr) {
-                                uint64_t res_packed = *reinterpret_cast<const uint64_t*>(&d_residual[out_base]);
-                                const bf16* res = reinterpret_cast<const bf16*>(&res_packed);
-                                uint64_t out_packed;
-                                bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                                out[0] = type_convert<bf16>(c_buf[r_base] + type_convert<float>(res[0]));
-                                out[1] = type_convert<bf16>(c_buf[r_base+1] + type_convert<float>(res[1]));
-                                out[2] = type_convert<bf16>(c_buf[r_base+2] + type_convert<float>(res[2]));
-                                out[3] = type_convert<bf16>(c_buf[r_base+3] + type_convert<float>(res[3]));
-                                nt_store_u64(&d_output[out_base], out_packed);
-                            } else {
-                                uint64_t out_packed;
-                                bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                                out[0] = type_convert<bf16>(c_buf[r_base]);
-                                out[1] = type_convert<bf16>(c_buf[r_base+1]);
-                                out[2] = type_convert<bf16>(c_buf[r_base+2]);
-                                out[3] = type_convert<bf16>(c_buf[r_base+3]);
-                                nt_store_u64(&d_output[out_base], out_packed);
-                            }
-                        } else {
-                            for (index_t i = 0; i < 4; i++) {
-                                index_t global_n = global_n_base + i;
-                                if (global_n < output_size) {
-                                    float val = c_buf[r_base + i];
-                                    if (residual_add && d_residual != nullptr) {
-                                        val += type_convert<float>(d_residual[global_m * o_stride + global_n]);
-                                    }
-                                    nt_store_bf16(&d_output[global_m * o_stride + global_n], type_convert<bf16>(val));
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                // 16x64 tiles: hand-written epilogue for 16x16 MFMA TransposedCDistribution
-                index_t warp_id = threadIdx.x >> 6;
-                index_t lane_id = threadIdx.x & 63;
-                index_t tile_row = lane_id & 15;
-                index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-
-                auto& c_buf = c_block_tile.get_thread_buffer();
-
-                index_t global_m = m_offset + tile_row;
-                index_t global_n_base = n_offset + tile_col_base;
-
-                if (global_m < BATCH_SIZE && global_n_base + 3 < output_size) {
-                    index_t out_base = global_m * o_stride + global_n_base;
-                    if (residual_add && d_residual != nullptr) {
-                        uint64_t res_packed = *reinterpret_cast<const uint64_t*>(&d_residual[out_base]);
-                        const bf16* res = reinterpret_cast<const bf16*>(&res_packed);
-                        uint64_t out_packed;
-                        bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                        out[0] = type_convert<bf16>(c_buf[0] + type_convert<float>(res[0]));
-                        out[1] = type_convert<bf16>(c_buf[1] + type_convert<float>(res[1]));
-                        out[2] = type_convert<bf16>(c_buf[2] + type_convert<float>(res[2]));
-                        out[3] = type_convert<bf16>(c_buf[3] + type_convert<float>(res[3]));
-                        nt_store_u64(&d_output[out_base], out_packed);
-                    } else {
-                        uint64_t out_packed;
-                        bf16* out = reinterpret_cast<bf16*>(&out_packed);
-                        out[0] = type_convert<bf16>(c_buf[0]);
-                        out[1] = type_convert<bf16>(c_buf[1]);
-                        out[2] = type_convert<bf16>(c_buf[2]);
-                        out[3] = type_convert<bf16>(c_buf[3]);
-                        nt_store_u64(&d_output[out_base], out_packed);
-                    }
-                } else if (global_m < BATCH_SIZE) {
-                    #pragma unroll
-                    for (index_t i = 0; i < 4; i++) {
-                        index_t global_n = global_n_base + i;
-                        if (global_n < output_size) {
-                            float val = c_buf[i];
-                            if (residual_add && d_residual != nullptr) {
-                                val += type_convert<float>(d_residual[global_m * o_stride + global_n]);
-                            }
-                            nt_store_bf16(&d_output[global_m * o_stride + global_n], type_convert<bf16>(val));
-                        }
-                    }
-                }
+                store_tile(out_window, cast_tile<bf16>(c_block_tile));
             }
         }
     }
@@ -652,7 +542,10 @@ __device__ __forceinline__ void linear_kernel_ck_splitk(void const *input_ptr,
 
     using BlockTile = sequence<MPerBlock, NPerBlock, KPerBlock>;
     using BlockWarps = sequence<MWarp, NWarp>;
-    using WarpTile = sequence<MPerBlock, NPerBlock / NWarp, KPerBlock>;
+    // MMAC warp tile: 16x16x32 for small (16x64 block), 16x32x64 for large (32x128 block)
+    using WarpTile = std::conditional_t<use_large_tile,
+                                        sequence<16, 32, 64>,
+                                        sequence<16, 16, 32>>;
 
     using GemmShape = TileGemmShape<BlockTile, BlockWarps, WarpTile>;
     using GemmTraits = TileGemmUniversalTraits<
@@ -804,7 +697,7 @@ __device__ __forceinline__ void splitk_linear_res_atomic_kernel(
 
     using BlockTile_CK = sequence<MPerBlock_CK, NPerBlock_CK, KPerBlock>;
     using BlockWarps = sequence<MWarp, NWarp>;
-    using WarpTile = sequence<16, 16, KPerBlock>;
+    using WarpTile = sequence<16, 16, 32>;
 
     using GemmShape = TileGemmShape<BlockTile_CK, BlockWarps, WarpTile>;
     using GemmTraits = TileGemmUniversalTraits<
@@ -859,30 +752,16 @@ __device__ __forceinline__ void splitk_linear_res_atomic_kernel(
             auto c_tile = pipeline(a_win, b_win, NumLoopK, smem);
             block_sync_lds();
 
-            // float32 atomicAdd epilogue
-            index_t warp_id = threadIdx.x >> 6;
-            index_t lane_id = threadIdx.x & 63;
-            index_t tile_row = lane_id & 15;
-            index_t tile_col_base = warp_id * 16 + ((lane_id >> 4) << 2);
-            auto& c_buf = c_tile.get_thread_buffer();
-
-            index_t global_m = m_offset + tile_row;
-            index_t global_n_base = n_offset + tile_col_base;
-
-            if (global_m < BATCH_SIZE && global_n_base + 3 < NPerBlock) {
-                index_t base = global_m * ws_stride + global_n_base;
-                atomicAdd(&d_ws[base],     c_buf[0]);
-                atomicAdd(&d_ws[base + 1], c_buf[1]);
-                atomicAdd(&d_ws[base + 2], c_buf[2]);
-                atomicAdd(&d_ws[base + 3], c_buf[3]);
-            } else if (global_m < BATCH_SIZE) {
-                #pragma unroll
-                for (index_t i = 0; i < 4; i++) {
-                    if (global_n_base + i < NPerBlock) {
-                        atomicAdd(&d_ws[global_m * ws_stride + global_n_base + i], c_buf[i]);
-                    }
+            // float32 atomicAdd epilogue (layout-independent: sweeps the C distribution)
+            for_each_c_element(c_tile, [&](index_t row_in_block,
+                                          index_t col_in_block,
+                                          float val) {
+                index_t global_m = m_offset + row_in_block;
+                index_t global_n = n_offset + col_in_block;
+                if (global_m < BATCH_SIZE && global_n < NPerBlock) {
+                    atomicAdd(&d_ws[global_m * ws_stride + global_n], val);
                 }
-            }
+            });
         }
     }
 

@@ -19,10 +19,28 @@
 
 namespace kernel {
 
-// Types for MFMA operations
+// Types for MFMA/MMAC operations
 using bf16 = ck_tile::bf16_t;
 using mfma_bf16x4 = short __attribute__((ext_vector_type(4)));
 using mfma_float4 = float __attribute__((ext_vector_type(4)));
+
+// 16x16x16 bf16 warp tile. IMPORTANT (verified on gfx936 by experiment):
+// MMAC(HCU) shares the MFMA A/B input layouts (kAMLane=16, kBNLane=16, kABKLane=4),
+// but its C OUTPUT layout DIFFERS from MFMA:
+//   MMAC:  c_vec[i] = C[m = lane%16][n = 4*i + lane/16]
+//   MFMA:  c_vec[i] = C[m = (lane/16)*4 + i][n = lane%16]
+// Callers must write back acc[] using the MMAC layout above.
+// On gfx938/gfx936 (DCU) the MFMA instruction is unavailable (no mai-insts) and the
+// real accelerator path is the MMAC/HCU instruction, so dispatch accordingly.
+__device__ __forceinline__ mfma_float4 mmac_16x16x16_bf16(mfma_bf16x4 a_vec,
+                                                         mfma_bf16x4 b_vec,
+                                                         mfma_float4 c_vec) {
+#if defined(__gfx938__) || defined(__gfx936__) 
+  return __builtin_hcu_mmac_f32_16x16x16_bf16(a_vec, b_vec, c_vec);
+#else
+  return __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+#endif
+}
 
 // Vectorized load/store helper (float4 = 16 bytes = 8 bf16)
 struct float4_t { float x, y, z, w; };
@@ -449,19 +467,20 @@ __device__ __forceinline__ void multitoken_paged_attention_ck(
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+          c_vec = mmac_16x16x16_bf16(a_vec, b_vec, c_vec);
           acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
         }
 
         // Store scores with causal masking
-        int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
-        int out_col = tile_n * MFMA_N + (lane % 16);
+        // MMAC C-layout: c_vec[r] = C[m=lane%16][n=4*r+lane/16]
+        int out_row = tile_m * MFMA_M + (lane % 16);
+        int out_col_base = tile_n * MFMA_N + (lane / 16);
 
-        if (out_col < curr_iter_len) {
+        if (out_row < q_rows) {
           #pragma unroll
           for (int r = 0; r < 4; r++) {
-            int out_row = out_row_base + r;
-            if (out_row < q_rows) {
+            int out_col = out_col_base + 4 * r;
+            if (out_col < curr_iter_len) {
               // Causal mask
               int token_idx = out_row / NUM_QO_PER_KV;
               int q_pos = seq_len - num_tokens + token_idx;
@@ -550,17 +569,18 @@ __device__ __forceinline__ void multitoken_paged_attention_ck(
           }
 
           mfma_float4 c_vec = {acc[0], acc[1], acc[2], acc[3]};
-          c_vec = __builtin_amdgcn_mfma_f32_16x16x16bf16_1k(a_vec, b_vec, c_vec, 0, 0, 0);
+          c_vec = mmac_16x16x16_bf16(a_vec, b_vec, c_vec);
           acc[0] = c_vec[0]; acc[1] = c_vec[1]; acc[2] = c_vec[2]; acc[3] = c_vec[3];
         }
 
         // Accumulate to output
-        int out_row_base = tile_m * MFMA_M + (lane / 16) * 4;
-        int out_col = out_tile * MFMA_N + (lane % 16);
+        // MMAC C-layout: c_vec[r] = C[m=lane%16][n=4*r+lane/16]
+        int out_row = tile_m * MFMA_M + (lane % 16);
+        int out_col_base = out_tile * MFMA_N + (lane / 16);
 
         #pragma unroll
         for (int r = 0; r < 4; r++) {
-          int out_row = out_row_base + r;
+          int out_col = out_col_base + 4 * r;
           if (out_row < q_rows && out_col < HEAD_DIM) {
             s_o[out_row * HEAD_DIM + out_col] += acc[r];
           }
