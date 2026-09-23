@@ -15,15 +15,25 @@
 
 #pragma once
 
+// NUM_THREADS: The number of threads used for loop strides in kernels
+// Must match the actual thread count used when launching kernels
+// MIRAGE HIP COMPAT: 与 megakernel 对齐——AMD 用 256 线程 + native 64-lane
+// wave；128 线程与 CK GEMM 策略静态 4-warp 假设不匹配（输出全零）
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+constexpr int NUM_THREADS = 256;
+constexpr int NUM_THREADS_PER_WARP = 64; // Native AMD wavefront size
+constexpr int NUM_WARPS = 4;             // 256 / 64 = 4 wavefronts
+#else
 constexpr int NUM_THREADS = 128;
 constexpr int NUM_THREADS_PER_WARP = 32;
 constexpr int NUM_WARPS = 4;
+#endif
 constexpr int WARPGROUP_WARPS = 4;
 
 constexpr float inf = 5e4;
 // TODO: only setting this for Hopper can have compilation issues on blackwell
 // and presumably ampere
-#if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL)
-constexpr int WORKER_NUM_THREADS = 256;   // Grace Hopper setting
+#if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL) || defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+constexpr int WORKER_NUM_THREADS = 256;   // Grace Hopper/AMD MI300 setting
 constexpr int CONSUMER_NUM_THREADS = 128; // Grace Hopper setting
 #endif

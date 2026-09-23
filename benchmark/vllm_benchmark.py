@@ -171,11 +171,16 @@ def _run_mirage_once(model, input_len, output_len, batch_size, prompt):
     # Force single-arch gfx936 for DTK JIT (env.sh sets a multi-arch list otherwise)
     env["AMDGPU_TARGETS"] = "gfx936"
 
+    # print(f"[Mirage] cmd: {' '.join(cmd)}")
+    # print(f"[Mirage] env: {env}")
     result = subprocess.run(
         cmd, capture_output=True, text=True, timeout=600,
         cwd=DEMO_DIR, env=env,
     )
     output = result.stdout + "\n" + result.stderr
+    print("[Mirage] subprocess output begin")
+    print(output)
+    print("[Mirage] subprocess output end")
     latency = parse_mirage_latency(output)
     prompt_len = parse_field(output, r'Prompt length\s+(\d+)')
     gen_len = parse_field(output, r'generate length\s+(\d+)')

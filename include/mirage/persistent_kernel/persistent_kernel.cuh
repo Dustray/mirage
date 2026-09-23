@@ -68,6 +68,11 @@ using namespace mirage::runtime;
 #elif defined(MIRAGE_GRACE_BLACKWELL)
 #define WORKER_NUM_THREADS 256
 #define SINGLE_KERNEL_NUM_THREADS 256
+#elif defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+// MIRAGE HIP COMPAT: AMD 沿用 megakernel 256 线程；128 线程与 CK GEMM
+// 策略静态 4-warp 假设不匹配（输出全零）
+#define WORKER_NUM_THREADS 256
+#define SINGLE_KERNEL_NUM_THREADS 256
 #else
 #define WORKER_NUM_THREADS 128
 #define SINGLE_KERNEL_NUM_THREADS 128
@@ -270,8 +275,17 @@ __device__ __forceinline__ bool
       config.step[request_id] = step + num_tokens;
       int step_advance = num_tokens;
 #endif
-#if defined(MPK_ENABLE_PROFILING) || defined(MPK_TEST_MODE)
+// MIRAGE HIP COMPAT: 原条件含 MPK_ENABLE_PROFILING（if(true)），剖析运行
+      // 第 1 迭代后所有请求被标记 done，num_tokens=0 即 terminate（step 停在
+      // 1、无文本输出）。profiling 改用正常终止条件（由 prompt_length-step
+      // 控制）；MPK_TEST_MODE 保持单迭代行为
+#if defined(MPK_TEST_MODE)
       if (true)
+#elif defined(MPK_ENABLE_PROFILING)
+      // MIRAGE HIP COMPAT: 剖析下由 profiling_num_iters 封顶（自 megakernel
+      // 移植；编译期 define，env MPK_PROFILING_ITERS 注入，0=不限）
+      if (config.profiling_num_iters > 0 &&
+          step + step_advance >= config.profiling_num_iters)
 #else
       if ((step + step_advance + 1 >= config.max_seq_length) ||
           ((config.tokens[request_id * MPK_MAX_SEQ_LENGTH + step +
@@ -435,16 +449,15 @@ __device__ __forceinline__ bool
 #endif
   config.step[0] = step + config.new_token_nums[0];
 
-#ifdef MPK_ENABLE_PROFILING
-  return false;
-#else
+  // MIRAGE HIP COMPAT: 原 profiling 下无条件 return false（单迭代设计），
+  // 剖析运行第 1 迭代即 terminate（step 停在 1、无文本输出）；改为与正常
+  // 运行相同的终止条件，profiler 缓冲区（30000x1280）足够容纳全程事件
   if ((step + 2 >= config.max_seq_length) ||
       (config.tokens[step + 1] == config.eos_token_id)) {
     return false;
   } else {
     return true;
   }
-#endif
 }
 #endif
 
@@ -764,6 +777,8 @@ __device__ __forceinline__ void terminate_schedulers(RuntimeConfig config) {
         &config.sched_queues[i][last_event_id % config.per_sched_queue_len], 0);
     // Use st.relaxed to make sure sched_queue updates are visible to scheduler
     // CTAs before incrementing its last_ready_event_id
+    // MIRAGE HIP COMPAT: 队列写对调度器可见后再发布
+    threadfence_gpu();
     size_t old;
     do {
       // old = atomicCAS(&config.sched_queue_last_ready_event_id[i],
@@ -832,8 +847,21 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
       (mirage::runtime::WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE - 56) /
           (int)(sizeof(TaskDesc) + sizeof(TaskId)),
       16);
+#if defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300)
+  // ==== MIRAGE HIP COMPAT: HIP 的 __shared__ 数组不支持非平凡默认构造、
+  // 不支持 alignas（要用 __align__），改用 char 存储 + reinterpret_cast
+  // 绕开（与 megakernel 的 hip_compat 方案一致）====
+  static_assert(TASK_DESCS_BUFFER_LENGTH <= 16, "Buffer length exceeds 16");
+  __shared__ __align__(alignof(TaskDesc))
+      char task_descs_storage[16 * sizeof(TaskDesc)];
+  __shared__ __align__(alignof(TaskId))
+      char task_ids_storage[16 * sizeof(TaskId)];
+  TaskDesc *task_descs = reinterpret_cast<TaskDesc *>(task_descs_storage);
+  TaskId *task_ids = reinterpret_cast<TaskId *>(task_ids_storage);
+#else
   __shared__ TaskDesc task_descs[TASK_DESCS_BUFFER_LENGTH];
   __shared__ TaskId task_ids[TASK_DESCS_BUFFER_LENGTH];
+#endif
   __shared__ TaskId *worker_queues[2];
   __shared__ int worker_queue_ids[2];
   __shared__ size_t next_task_pos[2];
@@ -879,7 +907,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
       if (threadIdx.x == 0) {
         while (next_task_pos[queue_idx] == last_task_pos[queue_idx]) {
           last_task_pos[queue_idx] =
-              ld_acquire_gpu_u64(&config.worker_queue_last_ready_task_id
+              ld_local_u64(&config.worker_queue_last_ready_task_id
                                       [worker_queue_ids[queue_idx]]);
           if (next_task_pos[queue_idx] < last_task_pos[queue_idx]) {
             break;
@@ -892,6 +920,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
         }
         assert(next_task_pos[queue_idx] + config.per_worker_queue_len >
                last_task_pos[queue_idx]);
+        // MIRAGE HIP COMPAT: 自旋后编译器屏障（对齐 megakernel）
+        fence_local();
       }
       __syncthreads();
       int num_loaded_tasks =
@@ -899,13 +929,13 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
               TASK_DESCS_BUFFER_LENGTH);
       // Load task ids
       if (threadIdx.x < num_loaded_tasks) {
-        task_ids[threadIdx.x] = ld_relaxed_gpu_u64(
+        task_ids[threadIdx.x] = ld_local_u64(
             &worker_queues[queue_idx][(next_task_pos[queue_idx] + threadIdx.x) %
                                       config.per_worker_queue_len]);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-#ifdef MPK_ENABLE_VERBOSE
+#ifdef MPK_ENABLE_TRACE_ALL
         for (int i = 0; i < num_loaded_tasks; i++) {
           printf(
               "[%d][FTCH] worker_id(%d) queue_idx(%d) next_task_pos(%llu, "
@@ -1002,7 +1032,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
           task_desc->task_type == 258 || task_desc->task_type == 259 ||
           task_desc->task_type == 261 || task_desc->task_type == 262 ||
           task_desc->task_type == 101;
-#ifdef MPK_ENABLE_VERBOSE
+#ifdef MPK_ENABLE_TRACE_ALL
       if (threadIdx.x == 0) {
         printf("[worker] _execute_task EXECUTE_TASK %d\n",
                task_desc->task_type);
@@ -1027,10 +1057,12 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
         assert(gpu_id == config.my_gpu_id);
         // Case 1: Trigger a local non-nvshmem event
         // int count = atomicSub(&config.all_event_counters[event_index], 1);
+        // MIRAGE HIP COMPAT: 任务输出写完后再发布（对齐 megakernel）
+        threadfence_gpu();
         EventCounter count = atom_add_release_gpu_u64(
             &config.all_event_counters[event_index], 1);
         int num_triggers = config.all_event_num_triggers[event_index];
-#ifdef MPK_ENABLE_VERBOSE
+#ifdef MPK_ENABLE_TRACE_ALL
         printf("[%d][DONE] worker_id(%d) iter_num(%llu) task_idx(%llu) "
                "event_id(%llu) "
                "event_type(local) count(%llu)\n",
@@ -1085,6 +1117,8 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
             // Use st.relaxed to make sure that the updated event_index is
             // visible to the scheduler CTA before updating its
             // last_ready_event_id
+            // MIRAGE HIP COMPAT: 队列写对调度器可见后再发布
+            threadfence_gpu();
             size_t old;
             do {
               old = atom_cas_release_gpu_u64(
@@ -1103,7 +1137,7 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
         assert(task_desc->task_type == TASK_NVSHMEM_ALLGATHER_STRIDED_PUT);
         // Note that nvshmem copy task signal counter during data copy
         // we don't need to do anything here is the task type is NVSHMEM_COPY
-#ifdef MPK_ENABLE_VERBOSE
+#ifdef MPK_ENABLE_TRACE_ALL
         printf("[%d][DONE] worker_id(%d) task_id(%llu) event_id(%llx) "
                "event_type(remote)\n",
                config.my_gpu_id,
@@ -1149,7 +1183,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
     // slot per block (num_groups=1).  Only warp 0 writes so events from
     // different warps don't interleave.
     PROFILER_INIT(
-        static_cast<uint64_t *>(config.profiler_buffer), 0, 1, (warp_id == 0));
+        static_cast<uint64_t *>(config.profiler_buffer), 0, 1,
+        (warp_id == 0 && !config.split_worker_scheduler));
     uint32_t sched_profiling_cnt = 0;
 #endif
 
@@ -1205,7 +1240,7 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
         // last_event_id = config.sched_queue_last_ready_event_id[sched_id];
         // last_event_id =
         //    atomicAdd(&config.sched_queue_last_ready_event_id[sched_id], 0);
-        last_event_pos[queue_idx] = ld_acquire_gpu_u64(
+        last_event_pos[queue_idx] = ld_local_u64(
             &config
                  .sched_queue_last_ready_event_id[sched_queue_ids[queue_idx]]);
 
@@ -1220,9 +1255,11 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
       // Make sure the schedule queue is not overflow
       assert(cur_event_pos[queue_idx] + config.per_sched_queue_len >
              last_event_pos[queue_idx]);
+      // MIRAGE HIP COMPAT: 自旋后编译器屏障（对齐 megakernel）
+      fence_local();
       // Launch new tasks
       // Use ld.acquire to read latest events
-      EventId event_id = ld_relaxed_gpu_u64(
+      EventId event_id = ld_local_u64(
           &sched_queues[queue_idx]
                        [cur_event_pos[queue_idx] % config.per_sched_queue_len]);
       EventDesc e = config.all_events[event_id];
@@ -1236,6 +1273,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                 &config.worker_queues[i][last_task_id %
                                          config.per_worker_queue_len],
                 0);
+            // MIRAGE HIP COMPAT: 队列写对 worker 可见后再发布
+            threadfence_gpu();
             atom_add_release_gpu_u64(&config.worker_queue_last_ready_task_id[i],
                                      1);
           }
@@ -1273,6 +1312,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               compute_task_id(iteration_num + 1, 1 /*begin_task_graph*/));
           // Use st.relaxed to make sure writes to worker_queues is visible to
           // worker CTAs before we increase its last_ready_task_id
+          // MIRAGE HIP COMPAT: 队列写对 worker 可见后再发布
+          threadfence_gpu();
           atom_add_release_gpu_u64(
               &config.worker_queue_last_ready_task_id[next_worker], 1);
 #ifdef MPK_ENABLE_VERBOSE
@@ -1312,6 +1353,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                   compute_task_id(iteration_num, position_index));
               // Use st.relaxed to make sure writes to worker_queues is visible
               // to worker CTAs before we increase its last_ready_task_id
+              // MIRAGE HIP COMPAT: 队列写对 worker 可见后再发布
+              threadfence_gpu();
               atom_add_release_gpu_u64(
                   &config.worker_queue_last_ready_task_id[next_worker], 1);
 
@@ -1366,6 +1409,8 @@ __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
               compute_task_id(iteration_num, i));
           // Use st.relaxed to make sure writes to worker_queues is visible to
           // worker CTAs before we increase its last_ready_task_id
+          // MIRAGE HIP COMPAT: 队列写对 worker 可见后再发布
+          threadfence_gpu();
           atom_add_release_gpu_u64(
               &config.worker_queue_last_ready_task_id[next_worker], 1);
 
@@ -1550,6 +1595,11 @@ extern "C" void
   global_runtime_config.num_remote_schedulers = num_remote_schedulers;
   global_runtime_config.max_seq_length = max_seq_length;
   global_runtime_config.eos_token_id = eos_token_id;
+// MIRAGE HIP COMPAT: profiling 迭代上限，编译期注入（自 megakernel 移植）
+#ifndef MPK_PROFILING_NUM_ITERS
+#define MPK_PROFILING_NUM_ITERS 0
+#endif
+  global_runtime_config.profiling_num_iters = MPK_PROFILING_NUM_ITERS;
   global_runtime_config.profiler_buffer = profiler_buffer;
   int num_schedulers = num_local_schedulers + num_remote_schedulers;
 

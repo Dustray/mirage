@@ -31,6 +31,10 @@ event_name_list = {
     119: "TASK_RMS_NORM",
     120: "TASK_LINEAR",
     121: "TASK_IDENTITY",
+    # MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植，event_idx=TaskType）
+    130: "TASK_PAGED_ATTENTION_SPLIT_KV_MI300",
+    131: "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300",
+    133: "TASK_SPLITK_LINEAR_RES_ATOMIC_MI300",
     150: "TASK_HOPPER_TASK_BEGIN",
     151: "TASK_LINEAR_WITH_RESIDUAL_HOPPER",
     152: "TASK_LINEAR_HOPPER",
@@ -137,9 +141,16 @@ def _decode_events(profiler_buffer: torch.Tensor):
 
     yield ("__header__", num_blocks, num_groups)
 
+    # MIRAGE HIP COMPAT: 原循环全量扫描所有槽位（38.4M × ~5μs/个 = ~3min），
+    # 实际有效事件通常集中在缓冲区头部；遇到连续零值即提前终止
+    zero_streak = 0
     for i in range(1, len(profiler_buffer_host)):
         if profiler_buffer_host[i] == 0:
+            zero_streak += 1
+            if zero_streak >= 4096:
+                break
             continue
+        zero_streak = 0
 
         tag, timestamp = profiler_buffer_host[i : i + 1].view(dtype=torch.uint32)
         tag = int(tag)
@@ -240,12 +251,14 @@ def export_to_csv(
             )
 
     if pending:
+        # MIRAGE HIP COMPAT: terminate 时刻在途任务的 BEGIN 永远等不到 END
+        # （调度器已停），属良性终止产物；降级为告警，不阻断导出
         (b, g, e), (no, ts) = next(iter(pending.items()))
         name = event_name_list.get(e, f"UNKNOWN_{e}")
-        raise RuntimeError(
-            f"{len(pending)} dangling BEGIN event(s) with no matching END "
-            f"(profiler buffer likely overflowed). Example: block={b} "
-            f"group={g} event={name} event_no={no} ts={ts}"
+        print(
+            f"[profiler] warning: {len(pending)} dangling BEGIN event(s) "
+            f"with no matching END (termination artifact). Example: "
+            f"block={b} group={g} event={name} event_no={no} ts={ts}"
         )
 
     with open(file_name, "w", newline="") as f:

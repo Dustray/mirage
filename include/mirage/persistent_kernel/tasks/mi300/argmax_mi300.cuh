@@ -110,6 +110,51 @@ __device__ __forceinline__ void
   }
 }
 
+// MIRAGE HIP COMPAT: task_register.cc 发射的分块变体（模板带真实词表大小，
+// 末参为 chunk_start，仅用于 padding 裁剪；input/output 指针已按分块偏移）。
+// 语义与 blackwell/argmax_sm100.cuh 的 argmax_partial_sm100_kernel 一致。
+template <typename T,
+          int BATCH_SIZE,
+          int CHUNK_SIZE,
+          int NUM_PARTIAL_TASKS,
+          int VOCAB_SIZE>
+__device__ __forceinline__ void
+    argmax_partial_kernel(void const *__restrict__ input_ptr,
+                          void *__restrict__ output_val_ptr,
+                          void *__restrict__ output_idx_ptr,
+                          int num_active_tokens,
+                          int chunk_start) {
+  T const *__restrict__ input = static_cast<T const *>(input_ptr);
+  T *__restrict__ output_val = static_cast<T *>(output_val_ptr);
+  long long *__restrict__ output_idx = static_cast<long long *>(output_idx_ptr);
+
+  int tidx = threadIdx.x;
+  // Positions at/after VOCAB_SIZE are lm_head padding rows; keep them out of
+  // the reduction so a padding logit can never win the argmax.
+  int const valid_len = min(CHUNK_SIZE, VOCAB_SIZE - chunk_start);
+
+#pragma unroll
+  for (int batch_idx = 0; batch_idx < num_active_tokens; batch_idx++) {
+    T local_max = T(-inf);
+    long long local_idx = -1;
+#pragma unroll
+    for (int i = tidx; i < valid_len; i += NUM_THREADS) {
+      T val = input[i + batch_idx * CHUNK_SIZE * NUM_PARTIAL_TASKS];
+      if (val > local_max) {
+        local_max = val;
+        local_idx = i;
+      }
+    }
+
+    block_reduce_max_idx<T>(local_max, local_idx);
+
+    if (tidx == 0) {
+      output_val[batch_idx * NUM_PARTIAL_TASKS] = local_max;
+      output_idx[batch_idx * NUM_PARTIAL_TASKS] = local_idx;
+    }
+  }
+}
+
 template <typename T, int BATCH_SIZE, int CHUNK_SIZE, int NUM_PARTIAL_TASKS>
 __device__ __forceinline__ void
     argmax_reduce_kernel(void const *__restrict__ input_val_ptr,

@@ -295,11 +295,13 @@ if __name__ == "__main__":
         head_dim = model.config.head_dim
         fused_outdim_1 = (num_q_heads + 2 * num_kv_heads) * head_dim
         fused_outdim_2 = 2 * intermediate_size
-        num_kv_cache_chunks = max(1, args.max_seq_length // 256)
+        num_kv_cache_chunks = max(1, (args.max_seq_length + 127) // 128)
 
         if args.profiling:
+            # MIRAGE HIP COMPAT: mi300 任务图有 ~13.8k tasks/iter（分页/分块粒度），
+            # 3000*128 槽位仅能装 ~1 个迭代即溢出；放大 64 倍保整轮可解析
             profiler_tensor = torch.zeros(
-                3000 * 128, dtype=torch.uint64, device="cuda"
+                30000 * 1280, dtype=torch.uint64, device="cuda"
             ).contiguous()
         else:
             profiler_tensor = None

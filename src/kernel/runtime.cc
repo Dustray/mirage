@@ -337,6 +337,9 @@ void register_mugraph(
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100) ||
                 (TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100) ||
                 (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) ||
+                // MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植）
+                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MI300) ||
+                (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300) ||
                 (task_type == TASK_ATTN_SM100)) {
               // Note that we assume grid_dim.x corresponds to
               // the request dimension
@@ -360,7 +363,10 @@ void register_mugraph(
             // Set paged attention split kv task kv_idx
             if (task_type == TASK_PAGED_ATTENTION_SPLIT_KV_SM100 ||
                 task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100 ||
-                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER) {
+                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER ||
+                // MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植）
+                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MI300 ||
+                task_type == TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300) {
               task.task_metadata.kv_idx = bid.z;
               task.task_metadata.merge_task_offset = bid.y;
             }
@@ -1876,6 +1882,14 @@ TaskGraphResult print_task_graph(
       "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100";
   task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER] =
       "TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER";
+  // MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植，CC 93）
+  task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_MI300] =
+      "TASK_PAGED_ATTENTION_SPLIT_KV_MI300";
+  task_type_to_name[TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300] =
+      "TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300";
+  // MIRAGE HIP COMPAT: splitk linear + 残差原子加（自 megakernel 移植）
+  task_type_to_name[TASK_SPLITK_LINEAR_RES_ATOMIC_MI300] =
+      "TASK_SPLITK_LINEAR_RES_ATOMIC_MI300";
   // Multi-gpu tasks
   task_type_to_name[TASK_NVSHMEM_ALLGATHER_STRIDED_PUT] =
       "TASK_NVSHMEM_ALLGATHER_STRIDED_PUT";

@@ -4434,6 +4434,254 @@ int TaskRegister::register_mla_mtp_reduce_sm100_task(
   code.e("}");
   return register_task_variant(TASK_MLA_MTP_REDUCE_SM100, code.to_string());
 }
+
+// MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel task_register.cc
+// register_paged_attention_split_kv_mi300_task 原样移植，CC 93）
+int TaskRegister::register_paged_attention_split_kv_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_q_heads
+  // params[1]: num_kv_heads
+  // params[2]: qk_norm
+  // params[3]: rotary_embed
+  // params[4]: max_seq_len
+  // params[5]: page_size
+  // params[6]: num_kv_chunks
+  assert(params.size() == 7);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;
+  int num_outputs = 2;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 3); // lse
+  assert(output_ops[1]->output_tensors[0].num_dims == 3); // output_tmp
+
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int num_q_heads = params[0];
+  int num_kv_heads = params[1];
+  int head_dim = input_ops[1]->output_tensors[0].dim[3];
+  int output_size = head_dim * num_q_heads;
+  int kv_stride = head_dim * num_kv_heads;
+  int max_seq_len = params[4];
+  int page_size = params[5];
+  int num_kv_chunks = params[6];
+  assert(input_ops[1]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
+  assert(input_ops[2]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  constexpr int SEQ_LEN_PER_BLOCK = 128;
+
+  // Cap MAX_TOKENS to fit in MI300X LDS (64KB - reserved).
+  // The attention kernel needs Q_ROWS = MAX_TOKENS * qo_per_kv shared memory rows.
+  // With Qwen3's qo_per_kv=4 and head_dim=128, MAX_TOKENS=8 uses ~49KB (fits).
+  // The scheduler's prepare_next_batch also caps tokens per request via
+  // MPK_MAX_TOKENS_PER_REQUEST to ensure runtime num_tokens <= MAX_TOKENS.
+  {
+    int qo_per_kv = num_q_heads / num_kv_heads;
+    constexpr int KV_TILE = 64;
+    // Available LDS = MAX_DYNAMIC_SHARED_MEMORY_SIZE (set in runtime_header.h)
+    // For MI300: 60KB - 3KB reserved = 57KB = 58368 bytes
+    constexpr int LDS_LIMIT = 58368;
+    int per_qrow = head_dim * 2 + KV_TILE * 4 + head_dim * 4 + 8;
+    int fixed = KV_TILE * head_dim * 2 + 256;
+    int max_qrows = (LDS_LIMIT - fixed) / per_qrow;
+    int max_tokens_lds = max_qrows / qo_per_kv;
+    if (max_tokens_lds < 1) max_tokens_lds = 1;
+    if (max_tokens > max_tokens_lds) {
+      max_tokens = max_tokens_lds;
+    }
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::multitoken_paged_attention_split_kv_task_impl<bfloat16, $, "
+         "$, $, $, $, $, "
+         "$, $, $, $, $, $>(",
+         num_q_heads / num_kv_heads, /* NUM_QO_HEADS */
+         1,                          /* NUM_KV_HEADS */
+         num_kv_heads,               /* NUM_QO_GROUPS */
+         kv_stride,                  /* KV_CACHE_STRIDE */
+         qkv_stride,                 /* QKV_STRIDE */
+         output_size *
+             num_kv_chunks, /* O_STRIDE (accounts for num_kv_chunks) */
+         head_dim,          /* HEAD_DIM */
+         SEQ_LEN_PER_BLOCK, /* SEQ_LEN_PER_BLOCK */
+         max_seq_len,       /* MAX_SEQ_LEN */
+         page_size,         /* PAGE_SIZE */
+         max_tokens,        /* MAX_TOKENS */
+         num_kv_chunks);    /* NUM_KV_CHUNKS */
+  code.e("    task_desc->input_ptrs[0],");  // qkv
+  code.e("    task_desc->input_ptrs[1],");  // k_cache
+  code.e("    task_desc->input_ptrs[2],");  // v_cache
+  code.e("    task_desc->output_ptrs[1],"); // output_tmp
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    $,", params[2] > 0);
+  code.e("    $,", params[3] > 0);
+  code.e("    task_desc->input_ptrs[3],");  // q_norm
+  code.e("    task_desc->input_ptrs[4],");  // k_norm
+  code.e("    task_desc->input_ptrs[5],");  // cos
+  code.e("    task_desc->input_ptrs[6],");  // sin
+  code.e("    1e-6f,");
+  code.e("    1e-6f,");
+  code.e("    task_desc->output_ptrs[0],"); // lse
+  code.e("    task_desc->task_metadata.kv_idx);");
+  return register_task_variant(TASK_PAGED_ATTENTION_SPLIT_KV_MI300,
+                               code.to_string());
+}
+
+// MIRAGE HIP COMPAT: mi300 split-kv merge（自 megakernel 原样移植；
+// merge_splitkv 为可移植标量实现，来自 tasks/ampere/merge_splitkv.cuh）
+int TaskRegister::register_paged_attention_split_kv_merge_mi300_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_qo_heads_per_kv
+  // params[1]: head_dim
+  // params[2]: max_seq_len
+  // params[3]: page_size
+  // params[4]: num_kv_heads
+  assert(params.size() == 5);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 2;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int num_q_heads_per_kv = params[0];
+  int head_dim = params[1];
+  int max_seq_len = params[2];
+  int page_size = params[3];
+  int num_kv_heads = params[4];
+
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  constexpr int SEQ_LEN_PER_BLOCK = 128;
+
+  // Cap MAX_TOKENS to match split-kv attention kernel's LDS limit
+  {
+    constexpr int KV_TILE = 64;
+    constexpr int LDS_LIMIT = 58368;
+    int per_qrow = head_dim * 2 + KV_TILE * 4 + head_dim * 4 + 8;
+    int fixed = KV_TILE * head_dim * 2 + 256;
+    int max_qrows = (LDS_LIMIT - fixed) / per_qrow;
+    int max_tokens_lds = max_qrows / num_q_heads_per_kv;
+    if (max_tokens_lds < 1) max_tokens_lds = 1;
+    if (max_tokens > max_tokens_lds) {
+      max_tokens = max_tokens_lds;
+    }
+  }
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  // Reuse the portable merge_splitkv kernel from ampere/
+  code.e("kernel::merge_splitkv<bfloat16, $, $, $, $, $, $, "
+         "$, $, $>(",
+         num_q_heads_per_kv,
+         1,
+         num_kv_heads,
+         head_dim,
+         max_tokens,
+         true,
+         ((max_seq_len + SEQ_LEN_PER_BLOCK - 1) / SEQ_LEN_PER_BLOCK),
+         SEQ_LEN_PER_BLOCK,
+         page_size);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    task_desc->task_metadata.merge_task_offset);");
+  return register_task_variant(TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300,
+                               code.to_string());
+}
+
+// MIRAGE HIP COMPAT: splitk linear + 残差原子加（自 megakernel 原样移植；
+// 设备侧为 tasks/mi300/linear_mi300.cuh 的 splitk_linear_res_atomic）
+int TaskRegister::register_splitk_linear_res_atomic_mi300_task(
+    threadblock::Graph const &bgraph,
+    std::vector<int> const &params) {
+  // params[0] = K_SPLITS
+  assert(params.size() == 1);
+  int k_splits = params[0];
+
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  // Inputs: 0=input, 1=weight, 2=residual, 3=workspace(float32), 4=done_counter(int32)
+  // Outputs: 5=output(bf16)
+  int num_inputs = 5;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+
+  // input[0]: [batch, K/K_SPLITS] — reduction_size per K-split
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  int reduction_size = input_ops[0]->dtensor.dim[1];
+
+  // output: [batch, NPerBlock]
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int batch_size = output_ops[0]->output_tensors[0].dim[0];
+  int n_per_block = output_ops[0]->output_tensors[0].dim[1];
+
+  // Output stride (bf16)
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_output_op =
+      static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  int output_stride = static_cast<int>(kn_output_op->input_strides[0]);
+
+  // Workspace stride (float32)
+  assert(input_ops[3]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_ws_op =
+      static_cast<kn::KNInputOp *>(input_ops[3]->dtensor.owner_op);
+  int ws_stride = static_cast<int>(kn_ws_op->input_strides[0]);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::splitk_linear_res_atomic<bfloat16, $, $, $, $>(",
+         batch_size,
+         n_per_block,
+         reduction_size,
+         k_splits);
+  code.e("    task_desc->input_ptrs[0],");   // input
+  code.e("    task_desc->input_ptrs[1],");   // weight
+  code.e("    task_desc->input_ptrs[2],");   // residual
+  code.e("    task_desc->input_ptrs[3],");   // workspace (float32)
+  code.e("    task_desc->output_ptrs[0],");  // output (bf16)
+  code.e("    (int*)task_desc->input_ptrs[4],"); // done_counter (int32)
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS],");
+  code.e("    $, $);", ws_stride, output_stride);
+  return register_task_variant(TASK_SPLITK_LINEAR_RES_ATOMIC_MI300,
+                               code.to_string());
+}
+
 int TaskRegister::register_paged_attention_split_kv_hopper_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   // params[0]: num_q_heads

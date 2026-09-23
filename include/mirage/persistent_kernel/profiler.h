@@ -129,7 +129,8 @@ struct ProfilerEntry {
 
 #define PROFILER_INIT(                                                         \
     profiler_buffer, group_idx, num_groups, write_thread_predicate)            \
-  if (tb::get_block_idx() == 0 && tb::get_thread_idx() == 0) {                 \
+  if (write_thread_predicate && tb::get_block_idx() == 0 &&                    \
+      tb::get_thread_idx() == 0) {                                             \
     entry.nblocks = tb::get_num_blocks();                                      \
     entry.ngroups = num_groups;                                                \
     profiler_buffer[0] = entry.raw;                                            \

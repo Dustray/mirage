@@ -1,154 +1,112 @@
-# Mirage Hygon HCU 兼容层说明
+# Mirage 海光 HCU (gfx936) 适配说明
 
-本文档记录将 Mirage 移植到海光 HCU（AMD CDNA 架构，通过 DTK 兼容层）的修改思路、编译方法和使用方式。
+本文档记录将 Mirage 移植到海光 HCU（AMD CDNA 架构，DTK 26.04 兼容层）后的**适配改动总览、构建方法与测试方法**。详细的适配过程（根因分析、逐阶段战役记录）见 [COMPAT_PORTING_DETAILS.md](COMPAT_PORTING_DETAILS.md)。
 
-## 1. 背景与目标
+## 1. 背景
 
-- **硬件/工具链**：海光 HCU + DTK 26.04 兼容层，`dcc` 26.02.0-0（clang 17.0.0）模拟 nvcc CUDA 12.6。
-- **核心问题**：Mirage 主库依赖 NVIDIA CUTLASS，其中包含大量 NVIDIA PTX/ASM，无法直接在 AMD CDNA 上编译。
-- **目标**：让主库 `mirage_runtime` 在不修改大量源码的前提下编译通过，同时保留后续同步官方代码的能力。
+- **硬件/工具链**：海光 HCU gfx936 + DTK 26.04（hipcc，clang 17），Python 3.10。
+- **核心问题**：Mirage 依赖 NVIDIA CUTLASS/PTX，persistent kernel 运行时依赖 CUDA 内存模型语义；gfx936 为 wave64 架构，与 NVIDIA 32-lane warp 模型差异大。
+- **目标**：Qwen3-8B megakernel（persistent kernel）在 HCU 上正确且高性能运行。当前已达成：`demo_fleet` 18.34 ms/token，与 megakernel 原版（18.3 ms）持平。
 
-## 2. 修改思路
+## 2. 适配改动总览
 
-### 2.1 最小化 CUTLASS 兼容层
+### 2.1 构建层（HIP 默认路径）
 
-不直接修改 Mirage 源码中的 CUTLASS 调用，而是在 `include/mirage_compat/cutlass/` 下提供一组 stub 头文件，覆盖主库实际使用的少量 CUTLASS 符号：
+- HIP 是**默认构建路径**：`CMakeLists.txt` 选项 `USE_HIP ON`，`setup.py` `_mirage_hip_build` 默认 True；设 `MIRAGE_USE_HIP=0` 回退 CUDA。
+- `include/mirage_compat/cuda` 置于头文件搜索路径最前，屏蔽 cudamocker；`.cu` 文件以 hipcc `-x hip` 编译。
+- CUTLASS 以 `include/mirage_compat/cutlass/` 下的 stub 头文件最小化替换（置于 `deps/cutlass/include` 之前），避免拉入 NVIDIA PTX/ASM。
+- PTX 内联汇编按 `__AMDGCN__`/`__HIP_PLATFORM_AMD__` guard 双路径保留：`mpk_atoms.cuh`（原子/loads-fences）、`profiler.h`（时钟）、`tasks/common/utils.cuh`（shuffle/exp2）、`copy_sm80.cuh`（cp.async 空操作）等。
 
-- `cutlass.h`：定义 `CUTLASS_DEVICE`、`CUTLASS_HOST_DEVICE`、`CUTLASS_GEMM_LOOP`，以及空的 `namespace cutlass {}` 和 fallback 宏（`CUTLASS_CMATH_NAMESPACE`、`CUTE_GCC_UNREACHABLE`、`CUTLASS_PRAGMA_UNROLL`）。
-- `numeric_types.h`：提供 `cutlass::half_t`（映射到 `half`）。
-- `array.h`：最小化 `cutlass::Array<T, N>` 实现。
-- `fast_math.h`：提供 `cutlass::fast_exp_op<T>`。
-- `matrix_coord.h`：提供 `cutlass::MatrixCoord`，接口与上游 CUTLASS 保持一致（`row()` / `column()`）。
+### 2.2 gfx936 wave64 运行时适配
 
-### 2.2 包含路径优先级
+- AMD 构建 worker CTA 使用 **256 线程 + 原生 64-lane wave**（`worker_config.h`/`persistent_kernel.cuh` 的 `NUM_THREADS=256`、`NUM_THREADS_PER_WARP=64`，`__HIP_PLATFORM_AMD__` guard），与 megakernel 一致；128 线程回退会破坏 CK GEMM 静态 4-warp tile 假设（GEMM 半输出/零输出 + 死锁）。
+- `lane_id()` 修复为 `threadIdx.x & (NUM_THREADS_PER_WARP - 1)`（原 32-lane 假设导致同一 wave 的 lane 0/32 双写共享内存，argmax 丢失真 max，文本退化）。
+- Warp shuffle 使用直接 warp ID 计算而非 shuffle 实现；`__shfl_sync` mask 按 wave64 语义处理。
+- MFMA 指令以 inline asm 实现（DTK 缺 `mai-insts` feature），modifier 使用 `0,0,0`。
+- `__shared__` 数组带非平凡默认构造时改用 defaulted 构造，避免动态初始化错误。
+- HIP API 显式 `reinterpret_cast` 函数指针。
 
-在 `CMakeLists.txt` 和 `setup.py` 中，将 `include/mirage_compat` 放在 `deps/cutlass/include` **之前**。这样编译器会优先使用 stub 头文件，不会进入真正的 CUTLASS 头文件，从而避开 PTX/ASM 错误。
+### 2.3 内存一致性修复（gfx9 vL1）
 
-### 2.3 移除未使用的 warp GEMM 头文件
+- 读侧：worker/scheduler 自旋读 `ld_acquire_gpu_u64`/`ld_relaxed_gpu_u64` → `ld_local_u64`（volatile）+ 自旋后 `fence_local`（4 处）。gfx936 分支的 `ld_nt_u64` 是裸 `global_load` 无 glc，计数器行进 vL1 后自旋永远读旧值。
+- 写侧：7 处发布原子（`atom_add_release_gpu_u64`/CAS 无 release 语义）前补 `threadfence_gpu`（worker 完成、worker→sched CAS、terminate、派发 ×4）。
 
-`src/kernel/cuda/customized_kernel.cu` 原本包含 `mirage/warp/cuda/matmul.h`，该头文件内部大量引用 CUTLASS warp GEMM 头文件，但 `GemmExecutor` 类在整个项目中从未被实例化。因此将其注释掉，避免把大量用不到的 CUTLASS 代码拉入主库编译。
+### 2.4 任务移植（自 megakernel，CC 93）
 
-### 2.4 为什么用兼容层而不是直接改源码
+- **split-kv attention**：`paged_attention_split_kv_mi300` + `merge` 五件套（task_register.h/cc、graph.cc 名字分发、persistent_kernel.py CC93 elif、runtime.cc 的 task_type_to_name 与 task_metadata：`kv_idx=bid.z`、`merge_task_offset=bid.y`、`request_id=bid.x`）。
+- **splitk_linear_res_atomic**（o_proj/down_proj 的 split-K + 残差原子加）：同五件套模式，枚举 `TASK_SPLITK_LINEAR_RES_ATOMIC_MI300=133`，5 输入 1 输出（input/weight/residual/workspace f32/done_counter i32 → output bf16）；设备内核复用 `tasks/mi300/linear_mi300.cuh` 现有实现。
+- 对应 demo 层：`demo/qwen3/demo_fleet.py`（megakernel demo 的 mirage 版配套）与 `demo/qwen3/demo.py`（profiler 缓冲区放大 64 倍）。
 
-- **减少 Mirage 源码改动**：只有 1 处包含被注释掉，其余改动都在 `include/mirage_compat/` 中。
-- **方便同步官方代码**：官方 CUTLASS 头文件路径被 stub 替换，Mirage 源码保持原样，后续 rebase/merge 冲突更少。
-- **可维护**：兼容层只包含主库实际用到的符号，范围明确。
+### 2.5 profiling 机制
 
-## 3. 文件变更清单
+- 自 megakernel 移植 `profiling_num_iters` 编译期注入：`RuntimeConfig` 字段 + `-DMPK_PROFILING_NUM_ITERS=N`（env `MPK_PROFILING_ITERS`，persistent_kernel.py）；OFFLINE 请求完成条件改三分支（TEST_MODE / PROFILING 封顶 / 正常）。
+- profiler 导出优化：`_decode_events` 连续零值早退（全量扫描 38.4M 槽位 ≈3min → 秒级）；CSV dangling BEGIN 降级为告警（terminate 时刻在途任务，良性）。
+- `demo.py` profiler 缓冲区放大 64 倍（30000×1280）；`demo_fleet.py` 再放大 8 倍（240000×1280，全程 1024 迭代安全）。
 
-### 新增文件
+## 3. 构建方法
 
-- `include/mirage_compat/README.md`
-- `include/mirage_compat/cutlass/cutlass.h`
-- `include/mirage_compat/cutlass/numeric_types.h`
-- `include/mirage_compat/cutlass/array.h`
-- `include/mirage_compat/cutlass/fast_math.h`
-- `include/mirage_compat/cutlass/matrix_coord.h`
-
-### 修改文件
-
-- `CMakeLists.txt`：添加 `include_directories(include/mirage_compat)`，并确保在 `deps/cutlass/include` 之前。
-- `setup.py`：将 `include/mirage_compat` 加入 cython `include_dirs` 和 `src_dirs`。
-- `src/kernel/cuda/customized_kernel.cu`：注释掉 `mirage/warp/cuda/matmul.h` 的包含。
-
-## 4. 编译方法
-
-### 4.1 环境准备
-
-确保已安装：
-
-- CMake >= 3.24
-- DTK / ROCm 工具链（`dcc` 在 PATH 中）
-- Python 3.10 及虚拟环境
-- Z3、nlohmann/json、Rust 等依赖已就绪
-
-### 4.2 CMake 配置
+### 3.1 一键构建
 
 ```bash
-
 cd /public/home/panyq/yiny/projects/mirage
+./build.sh                     # HIP 构建（默认），gfx936
+MIRAGE_USE_HIP=0 ./build.sh    # 回退 CUDA 路径（NVIDIA 环境）
+```
+
+`build.sh` 做的事：设置 `MIRAGE_USE_HIP`/`AMDGPU_TARGETS`（无需 source DTK 环境，镜像默认 PATH 已含 hipcc、`ROCM_PATH=/opt/dtk`，setup.py/CMakeLists 的 HIP 分支均按此解析）→ `find python -name "*.pyx" -exec touch {} +`（规避 distutils 重链陷阱，改 `src/kernel/*.cc` 后必须）→ `python setup.py build_ext --inplace` → 校验产物。
+
+### 3.2 验证产物含新代码
+
+```bash
+SO=python/mirage/core.cpython-310-x86_64-linux-gnu.so
+readelf -p .rodata $SO | grep <新任务名/符号名>
+```
+
+> 不要用 `strings` 验证：`.debug_str` 含 DWARF 枚举名会产生假阳性。
+
+### 3.3 CMake 主库构建（可选，C++ 库用途）
+
+```bash
 export MIRAGE_HOME=$(pwd)
 rm -rf build && mkdir build && cd build
-
 cmake .. -DCMAKE_BUILD_TYPE=Release \
   -DZ3_CXX_INCLUDE_DIRS=/usr/local/lib/python3.10/dist-packages/z3/include \
-  -DZ3_LIBRARIES=/usr/local/lib/python3.10/dist-packages/z3/lib/libz3.so \
-  -DABSTRACT_SUBEXPR_LIB=$(MIRAGE_HOME)/build/abstract_subexpr/release \
-  -DABSTRACT_SUBEXPR_LIBRARIES=$(MIRAGE_HOME)/build/abstract_subexpr/release/libabstract_subexpr.so \
-  -DFORMAL_VERIFIER_LIB=$(MIRAGE_HOME)/build/formal_verifier/release \
-  -DFORMAL_VERIFIER_LIBRARIES=$(MIRAGE_HOME)/build/formal_verifier/release/libformal_verifier.so
+  -DZ3_LIBRARIES=/usr/local/lib/python3.10/dist-packages/z3/lib/libz3.so
+make -j mirage_runtime    # 生成 libmirage_runtime.a（USE_HIP 默认 ON）
 ```
 
-> 注意：Z3 路径请根据实际环境调整。如果 `abstract_subexpr` 和 `formal_verifier` 尚未构建，需要先按项目原流程构建这两个 Rust 依赖。
-> 注意：DTK/HCU 环境在构建前需要先 `source /opt/dtk/cuda/env.sh`。
+## 4. 测试方法
 
-### 4.3 编译主库
+### 4.1 一键测试
 
 ```bash
-cd $(MIRAGE_HOME)/build
-make -j mirage_runtime
+./test.sh                          # demo_fleet.py，1024 tokens（性能+正确性基线）
+./test.sh demo.py                  # mirage 原版 demo（无 splitk linear 优化）
+./test.sh demo_fleet.py 128        # 自定义生成 token 数
+PROF_ITERS=32 ./test.sh            # 剖析模式，产出 perfetto-trace + csv
+PROF_ITERS=1024 ./test.sh          # 剖析全程（demo_fleet 缓冲区已放大，安全）
 ```
 
-编译成功后会在 `build/` 下生成 `libmirage_runtime.a`。
+### 4.2 验证点
 
-## 5. 使用方法
+- **EXIT=0**；非剖析模式生成 token 数 = `max_seq_length(1088) - prompt(64)` = 1024（`--max-new-tokens` 不进内核，OFFLINE 终止由 prompt_length 控制）。
+- **per-token 延迟基线**：demo_fleet 18.34 ms ≈ megakernel 18.3 ms < demo.py 21.5 ms。
+- **文本连贯**：`<think>` 推理块 + 结构化正文（与 torch 基线模式一致）。
+- 剖析模式无文本输出属预期；`MPK_PROFILING_ITERS` 必须为正整数（0 = 无限跑，写穿缓冲区 VMFault）。
 
-### 5.1 作为 C++ 库使用
-
-在 CMake 项目中链接 `mirage_runtime`：
-
-```cmake
-add_subdirectory($MIRAGE_HOME mirage)
-target_link_libraries(your_target mirage_runtime)
-```
-
-### 5.2 Python 包安装
+### 4.3 对照测试（megakernel）
 
 ```bash
-cd $(MIRAGE_HOME)
-source mirageenv/bin/activate
-python setup.py install
+# 容器内（同镜像、同模型）；脚本口径：megakernel 侧 unset MIRAGE_USE_HIP，
+# PYTHONPATH/MIRAGE_HOME 指向 megakernel，--profiling --trace-name /tmp/mega_prof_N
+docker exec mirage bash /tmp/mega_prof_32.sh    # 32 迭代，与 mirage PROF_ITERS=32 同口径
 ```
 
-> 当前阶段主库 `mirage_runtime` 已可编译，但 Python 包的完整安装可能还需要进一步处理 CUDA/ROCm 运行时和 JIT 相关部分。
+产物对照（宿主机 `/tmp/traces/`）：`megakernel_32.perfetto-trace`（55MB）、`mirage_fleet.perfetto-trace`（55MB）等，ui.perfetto.dev 打开。两项目 32 迭代事件分布完全对齐（SPLITK_LINEAR_RES_ATOMIC=9216/iter、SPLIT_KV=2592/iter、MERGE=288/iter）。
 
-### 5.3 验证编译
+## 5. 已知限制
 
-```bash
-cd $(MIRAGE_HOME)/build
-make -j mirage_runtime
-ls -lh libmirage_runtime.a
-```
-
-## 6. 已知限制
-
-- 本兼容层仅覆盖主库 `mirage_runtime` 编译所需的 CUTLASS 符号。
-- Blackwell/Hopper 专用任务头文件（`include/mirage/persistent_kernel/tasks/` 下的 `blackwell_*.cuh`）属于 JIT 生成代码，不参与主库编译，当前未做处理。
-- 实际在 HCU 上执行生成的 kernel 还需要进一步将 CUDA kernel 代码转译为 HIP/ROCm，或依赖 DTK 的 CUDA 兼容运行时支持。
-- 通用路径（`ampere/`、`tasks/common/`）中的 PTX 内联汇编已增加 HIP 分支处理，详见第 8 节。
-- 在 HCU 上实际执行 megakernel 时，JIT 生成的 kernel 仍可能包含 Blackwell/Hopper 专用 PTX，需要进一步处理或限制只使用 ampere 路径。
-
-## 7. 后续工作
-
-- [ ] 验证 Python 包能否完整安装并导入 `mirage`。
-- [ ] 运行简单的 fingerprint/operator 测试，确认数值正确性。
-- [ ] 评估是否需要为 HCU 实现自定义 kernel backend，替代 JIT 生成的 CUDA kernel。
-
-## 8. PTX/ASM 内联汇编兼容化
-
-Mirage persistent kernel 在通用路径（`ampere` 及 `tasks/common`）中使用了少量 PTX 内联汇编。为了让这些代码在 HCU/ROCm 上能编译，对以下文件做了 `#if defined(__HIP_DEVICE_COMPILE__) && defined(__HIP_PLATFORM_AMD__)` 分支：
-
-- `include/mirage/persistent_kernel/profiler.h`
-  - `sleep_cycles()` / `get_timestamp()`：NVIDIA 路径保留 `%globaltimer_lo` PTX；HIP 路径改用 `__builtin_amdgcn_s_memrealtime()`。
-- `include/mirage/persistent_kernel/mpk_atoms.cuh`
-  - `atom_add_release_gpu_s32/u64`、`atom_cas_release_gpu_u64`：HIP 路径改用 `atomicAdd` / `atomicCAS` + `__builtin_amdgcn_fence(..., "agent")`。
-  - `ld_acquire_gpu_u64`、`ld_acquire_sys_u64`、`ld_relaxed_gpu_u64`、`st_relaxed_gpu_u64`：HIP 路径改用 `__atomic_load_n` / `__atomic_store_n` + 合适的 `__builtin_amdgcn_fence`。
-  - `ld_acquire_sys_i32`、`st_release_sys_i32`：HIP 路径改用 `__atomic_load_n` / `__atomic_store_n` + `__builtin_amdgcn_fence(..., "system")`。
-  - 新增 `threadfence_gpu()`：HIP 路径映射到 `__builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent")`。
-- `include/mirage/persistent_kernel/tasks/common/utils.cuh`
-  - `shfl_xor_sync`：HIP 路径改用 `__shfl_xor(x, lane_mask, warpSize)`。
-  - `ptx_exp2` / `ptx_log2`：HIP 路径改用标准 `exp2f` / `log2f`。
-- `include/mirage/persistent_kernel/tasks/common/copy_sm80.cuh`
-  - `cp.async.*` 与 `ldmatrix` 是 Ampere+ 特性，在 HCU 上 `__CUDA_ARCH__` 不会 >= 800，因此 `CP_ASYNC_SM80_ENABLED` 不会定义，这些函数在 HIP 路径下为空操作；NVIDIA 路径保持原 PTX 不变。
-
-所有修改都保留 NVIDIA 路径的原始 PTX 代码，仅在 HIP/HCU 编译时走替代实现。
+- 剖析模式 per-token 延迟含导出开销，不代表真实性能（以非剖析运行为准）。
+- `demo.py` 的 profiler 缓冲区为 32 迭代容量级，剖析全程需用 `demo_fleet.py`（已放大 8 倍）。
+- CK-FMHA 路径（`USE_CK_FMHA=1`）在本环境未启用，测试统一 `USE_CK_FMHA=0`。
+- megakernel/mirage 的 OFFLINE PROFILING 完成条件为**替换**而非叠加正常终止条件，`MPK_PROFILING_ITERS=0` 会无限跑（详见 COMPAT_PORTING_DETAILS.md）。

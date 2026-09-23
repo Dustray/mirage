@@ -309,4 +309,18 @@ __device__ __forceinline__ void rms_norm_tiled_impl(void const *input_ptr,
   }
 }
 
+// MIRAGE HIP COMPAT: task_register.cc 发射的旧签名（TASK_RMS_NORM_HOPPER，
+// 单 CTA 串行处理全部 batch 行）；逐行复用 rms_norm_tiled_impl。
+template <typename T, int BATCH_SIZE, int HIDDEN_DIM>
+__device__ __forceinline__ void rms_norm_hopper_impl(void const *input_ptr,
+                                                     void const *weight_ptr,
+                                                     void *output_ptr,
+                                                     float eps) {
+#pragma unroll
+  for (int tile_idx = 0; tile_idx < BATCH_SIZE; tile_idx++) {
+    rms_norm_tiled_impl<T, BATCH_SIZE, HIDDEN_DIM>(
+        input_ptr, weight_ptr, output_ptr, eps, tile_idx);
+  }
+}
+
 } // namespace kernel

@@ -35,6 +35,20 @@ def get_configurations_from_gpu(rank):
     props = torch.cuda.get_device_properties(rank)
     sm_cnt = props.multi_processor_count
     print("sm_cnt: ", sm_cnt)
+    # MIRAGE HIP COMPAT: AMD persistent kernel 物理块数必须等于 CU 数，防止块
+    # 排队导致 worker/scheduler 互等死锁（对齐 megakernel gfx93x 方案）
+    is_amd = hasattr(torch.version, "hip") and torch.version.hip is not None
+    if is_amd:
+        gcn_arch = getattr(props, "gcnArchName", "") or getattr(
+            props, "gcn_arch_name", "")
+        if "gfx93" in gcn_arch:
+            # gfx936/938：4 个 scheduler 以 stride 方式并行派发，
+            # 其余 CU 全部作为 worker（物理块数 = sm_cnt）
+            worker = sm_cnt - 4
+            scheduler = 4
+            print("AMD gfx93x config: workers={}, schedulers={}".format(
+                worker, scheduler))
+            return worker, scheduler
     worker = 0
     if sm_cnt >= 160:
         worker = 144

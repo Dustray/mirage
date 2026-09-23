@@ -164,6 +164,9 @@ __device__ __forceinline__ int atom_add_release_gpu_s32(int *addr, int val) {
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   int old_val;
+  // MIRAGE HIP COMPAT: GFX9 flat 指令无 release 语义，补 agent-scope
+  // release fence，保证之前的写（如任务结果、队列槽位）全局可见
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   asm volatile(
       "flat_atomic_add %0, %1, %2 sc0 sc1\n"
       "s_waitcnt vmcnt(0) lgkmcnt(0)"
@@ -188,6 +191,9 @@ __device__ __forceinline__ unsigned long long int
   // Ordering provided by explicit threadfence_gpu() before this call.
   // sc0 sc1 required on GFX942 for cross-CU atomic visibility.
   unsigned long long int old_val;
+  // MIRAGE HIP COMPAT: GFX9 flat 指令无 release 语义，补 agent-scope
+  // release fence，保证之前的写（如任务结果、队列槽位）全局可见
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
 #if defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
   asm volatile(
       "flat_atomic_add_x2 %0, %1, %2 sc0 sc1\n"
@@ -223,6 +229,9 @@ __device__ __forceinline__ unsigned long long int
   // flat_atomic_cmpswap_x2 layout: {swap[63:0], compare[63:0]} in 4 VGPRs.
   typedef unsigned long long v2u64 __attribute__((ext_vector_type(2)));
   v2u64 cmp_swap;
+  // MIRAGE HIP COMPAT: GFX9 flat 指令无 release 语义，补 agent-scope
+  // release fence，保证之前的写（如任务结果、队列槽位）全局可见
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
   cmp_swap[0] = val;  // swap value (low 64 bits) — new value to write
   cmp_swap[1] = cmp;  // compare value (high 64 bits) — expected old value
   unsigned long long int old_val;
@@ -258,6 +267,19 @@ __device__ __forceinline__ unsigned long long int
   return ld_nt_u64(addr);
 #elif defined(MPK_USE_RELAXED_ATOMICS)
   return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#if !defined(MPK_DISABLE_GLC_LOAD)
+  // MIRAGE HIP COMPAT: GFX9 L1 非 coherent，轮询 load 必须带 glc 直读 L2，
+  // 否则首次装入 L1 后永远命中旧值（自旋等待永卡）
+  unsigned long long int val;
+  asm volatile("flat_load_dwordx2 %0, %1 glc\n"
+                 : "=v"(val)
+                 : "v"(addr)
+                 : "memory");
+  return val;
+#else
+  // HIP/AMD: Use SEQ_CST for cross-XCD visibility on MI300
+  return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
+#endif
 #else
   // HIP/AMD: Use SEQ_CST for cross-XCD visibility on MI300
   return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
@@ -274,6 +296,15 @@ __device__ __forceinline__ unsigned long long int
 #if defined(__HIP_DEVICE_COMPILE__) && (defined(__HIP_PLATFORM_AMD__) || defined(MIRAGE_AMD_MI300))
 #ifdef MPK_USE_RELAXED_ATOMICS
   return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#elif !defined(MPK_DISABLE_GLC_LOAD)
+  // MIRAGE HIP COMPAT: GFX9 L1 非 coherent，轮询 load 必须带 glc 直读 L2，
+  // 否则首次装入 L1 后永远命中旧值（自旋等待永卡）
+  unsigned long long int val;
+  asm volatile("flat_load_dwordx2 %0, %1 glc\n"
+                 : "=v"(val)
+                 : "v"(addr)
+                 : "memory");
+  return val;
 #else
   // HIP/AMD: Use SEQ_CST for cross-XCD visibility on MI300
   return __atomic_load_n(addr, __ATOMIC_SEQ_CST);
@@ -295,8 +326,19 @@ __device__ __forceinline__ unsigned long long int
   // Non-temporal load bypasses cache, reads from memory
   return ld_nt_u64(addr);
 #else
+#if !defined(MPK_DISABLE_GLC_LOAD)
+  // MIRAGE HIP COMPAT: GFX9 L1 非 coherent，轮询 load 必须带 glc 直读 L2，
+  // 否则首次装入 L1 后永远命中旧值（自旋等待永卡）
+  unsigned long long int val;
+  asm volatile("flat_load_dwordx2 %0, %1 glc\n"
+                 : "=v"(val)
+                 : "v"(addr)
+                 : "memory");
+  return val;
+#else
   // HIP/AMD: use __atomic_load_n with relaxed ordering
   return __atomic_load_n(addr, __ATOMIC_RELAXED);
+#endif
 #endif
 #else
   unsigned long long int val;

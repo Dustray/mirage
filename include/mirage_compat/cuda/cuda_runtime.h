@@ -49,6 +49,9 @@ using cudaPointerAttributes = hipPointerAttribute_t;
 using cudaDataType_t = hipDataType;
 
 // ==== MIRAGE HIP COMPAT: DTK 26.04 头文件缺少 __nanosleep，补一个近似实现 ====
+// 仅 AMD 设备编译（clang + __AMDGCN__）时可见；宿主 g++ 的 cython 阶段
+// 不认识 amdgcn 内建指令，unconditional 声明会导致 build_ext 失败。
+#if defined(__clang__) && defined(__AMDGCN__)
 __device__ __forceinline__ void __nanosleep(unsigned long long ns) {
   // s_sleep(1) 的实际时长与频率相关，这里按每条约 1us 粗略逼近
   while (ns > 1000) {
@@ -56,6 +59,7 @@ __device__ __forceinline__ void __nanosleep(unsigned long long ns) {
     ns -= 1000;
   }
 }
+#endif
 // ==== end MIRAGE HIP COMPAT ====
 
 // cuBLAS/cuDNN library data type constants map 1:1 onto the hipDataType enum
@@ -139,6 +143,9 @@ __device__ __forceinline__ void __nanosleep(unsigned long long ns) {
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamSynchronize hipStreamSynchronize
+// MIRAGE HIP COMPAT: 心跳轮询需要
+#define cudaStreamQuery hipStreamQuery
+#define cudaGetSymbolAddress hipGetSymbolAddress
 #define cudaStreamWaitEvent hipStreamWaitEvent
 
 #define cudaEventCreateWithFlags hipEventCreateWithFlags

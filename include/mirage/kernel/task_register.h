@@ -141,6 +141,14 @@ public:
       threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_paged_attention_split_kv_merge_sm100_task(
       threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植，CC 93）
+  int register_paged_attention_split_kv_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  int register_paged_attention_split_kv_merge_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
+  // MIRAGE HIP COMPAT: splitk linear + 残差原子加（自 megakernel 移植，CC 93）
+  int register_splitk_linear_res_atomic_mi300_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_mla_decode_sm100_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params);
   int register_mla_reduce_sm100_task(threadblock::Graph const &bgraph,

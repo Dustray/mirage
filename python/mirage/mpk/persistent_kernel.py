@@ -406,16 +406,36 @@ def get_compile_command(
                 "-fPIC",
                 "-ffast-math",
                 "-D__HIP_PLATFORM_AMD__=1",
+                "-DMIRAGE_AMD_MI300",
+                "-DMIRAGE_BACKEND_USE_ROCM",
                 # DTK's clang pipeline does not define the macro that gates
                 # the HIP warp-sync (__shfl_*_sync) declarations; define it
                 # explicitly (matches the upstream ROCm behavior).
                 "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
+                # ==== MIRAGE HIP COMPAT: 屏蔽 DTK clang 的三类噪音警告 ====
+                # pass-failed：#pragma unroll 作用于运行时循环次数，无法展开属正常
+                "-Wno-pass-failed",
+                "-Wno-return-type-void-func",
+                "-Wno-unused-result",
+                # ==== end MIRAGE HIP COMPAT ====
             ]
         )
     # ==== end MIRAGE HIP COMPAT ====
     
+    # ==== MIRAGE HIP COMPAT: 设备端 verbose 打印开关（MPK_ENABLE_VERBOSE=1 生效，
+    # 用于调试调度器/worker 任务流水）====
+    if os.environ.get("MPK_ENABLE_VERBOSE", "0") == "1":
+        flags = flags + ["-DMPK_ENABLE_VERBOSE"]
+    # ==== end MIRAGE HIP COMPAT ====
+
     if profiling:
         flags = flags + ["-DMPK_ENABLE_PROFILING"]
+        # MIRAGE HIP COMPAT: profiling 迭代上限（自 megakernel 移植；env
+        # MPK_PROFILING_ITERS，0=不限跑满 max_seq_length）
+        profiling_iters = int(os.environ.get("MPK_PROFILING_ITERS", "1"))
+        flags = flags + [f"-DMPK_PROFILING_NUM_ITERS={profiling_iters}"]
+    else:
+        flags = flags + ["-DMPK_PROFILING_NUM_ITERS=0"]
 
     return common_cmd + specific_cmd + flags
 
@@ -508,6 +528,8 @@ class PersistentKernel:
         self.allocate_nvshmem_teams = 0
         # determine total number of requests for offline serving
         self.target_cc = torch.cuda.get_device_properties(0).major * 10 + torch.cuda.get_device_properties(0).minor
+        # ==== MIRAGE HIP COMPAT: 记录 JIT 是否为 HIP 编译器，供任务名选择用 ====
+        self.is_hip = _is_hip_compiler(find_gpu_compiler())
 
         if test_mode:
             # Auto-allocate any meta tensors the test author didn't provide so
@@ -1393,6 +1415,9 @@ class PersistentKernel:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_sm100", params)
         elif self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_hopper", params)
+        elif self.target_cc == 93:
+            # MIRAGE HIP COMPAT: mi300 split-kv attention（自 megakernel 移植）
+            self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_mi300", params)
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
 
@@ -1434,6 +1459,9 @@ class PersistentKernel:
         )
         if self.target_cc == 100 or self.target_cc == 90:
             self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_sm100", params)
+        elif self.target_cc == 93:
+            # MIRAGE HIP COMPAT: mi300 split-kv merge（自 megakernel 移植）
+            self.kn_graph.register_task(tb_graph, "paged_attention_split_kv_merge_mi300", params)
         else:
             raise ValueError(f"Unsupported target CC: {self.target_cc}")
             
@@ -2246,6 +2274,40 @@ class PersistentKernel:
         else:
             assert False
 
+    def splitk_linear_res_atomic_layer(
+        self,
+        input: DTensor,
+        weight: DTensor,
+        residual: DTensor,
+        workspace: DTensor,
+        done_counter: DTensor,
+        output: DTensor,
+        k_splits: int,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        # MIRAGE HIP COMPAT: splitk linear + 残差原子加（自 megakernel 移植）
+        """Single-task split-K with float32 atomicAdd.
+        grid_dim = (N_blocks, K_splits, 1)
+        """
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        # input [batch, K]: grid_dim.y partitions dim 1 (K)
+        tb_graph.new_input(input, (-1, 1, -1), 1, True)
+        # weight [N, K]: grid_dim.x partitions dim 0 (N), grid_dim.y partitions dim 1 (K)
+        tb_graph.new_input(weight, (0, 1, -1), 1, True)
+        # residual [batch, hidden]: grid_dim.x partitions dim 1 (N portion)
+        tb_graph.new_input(residual, (1, -1, -1), 1, True)
+        # workspace [batch, hidden] float32: grid_dim.x partitions dim 1, shared across K-splits
+        tb_graph.new_input(workspace, (1, -1, -1), 1, True)
+        # done_counter [n_blocks] int32: grid_dim.x partitions dim 0
+        tb_graph.new_input(done_counter, (0, -1, -1), 1, True)
+        # output [batch, hidden] bf16: grid_dim.x partitions dim 1
+        tb_graph.new_input(output, (1, -1, -1), -1, True)
+        self.kn_graph.customized(
+            [input, weight, residual, workspace, done_counter, output], tb_graph)
+        self.kn_graph.register_task(
+            tb_graph, "splitk_linear_res_atomic_mi300", [k_splits])
+
     def linear_layer(
         self,
         input: DTensor,
@@ -2295,7 +2357,11 @@ class PersistentKernel:
         elif self.target_cc >= 100 and self.target_cc < 120:
             self.kn_graph.register_task(tb_graph, "linear_sm100")
         elif self.target_cc >= 90 and self.target_cc < 100:
-            if weight.dim(0) // grid_dim[0] <= 64:
+            # ==== MIRAGE HIP COMPAT: hopper linear 依赖 TMA（NVIDIA 专有），
+            # HIP 下退回 ampere 通用 linear 任务 ====
+            if self.is_hip:
+                self.kn_graph.register_task(tb_graph, "linear")
+            elif weight.dim(0) // grid_dim[0] <= 64:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
                 # self.kn_graph.register_task(tb_graph, "linear_cutlass_hopper")
             else:
@@ -2334,7 +2400,11 @@ class PersistentKernel:
         if self.target_cc >= 100 and self.target_cc < 120:
             self.kn_graph.register_task(tb_graph, "linear_with_residual_sm100", params)
         elif self.target_cc >= 90 and self.target_cc < 100:
-            if weight.dim(0) // grid_dim[0] <= 64:
+            # ==== MIRAGE HIP COMPAT: hopper linear 依赖 TMA（NVIDIA 专有），
+            # HIP 下退回 ampere 通用 linear 任务（带 residual） ====
+            if self.is_hip:
+                self.kn_graph.register_task(tb_graph, "linear_with_residual", params)
+            elif weight.dim(0) // grid_dim[0] <= 64:
                 # self.kn_graph.register_task(tb_graph, "linear_cutlass_with_residual_hopper")
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper", params)
             else:
@@ -3092,6 +3162,14 @@ class PersistentKernel:
         hard_code = HARD_CODE
         with open(cuda_code_path, "w") as f:
             f.write(results["cuda_code"] + hard_code)
+
+        # ==== MIRAGE HIP COMPAT: 调试用——MPK_SAVE_TEST_CU 指定路径时保存生成的
+        # test.cu 与 task_graph.json（不传则不保存）====
+        _save_cu = os.environ.get("MPK_SAVE_TEST_CU", "")
+        if _save_cu:
+            shutil.copy(cuda_code_path, _save_cu)
+            shutil.copy(json_file_path, _save_cu + ".json")
+        # ==== end MIRAGE HIP COMPAT ====
             
         if output_dir is not None:
             os.makedirs(output_dir, exist_ok=True)

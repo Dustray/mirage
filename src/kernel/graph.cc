@@ -764,6 +764,24 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
             customized->bgraph, params);
     task_config[op] = std::make_tuple(
         2, 1, TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100, variant_id);
+  } else if (name == "paged_attention_split_kv_mi300") {
+    int variant_id =
+        task_register->register_paged_attention_split_kv_mi300_task(
+            customized->bgraph, params);
+    task_config[op] =
+        std::make_tuple(7, 2, TASK_PAGED_ATTENTION_SPLIT_KV_MI300, variant_id);
+  } else if (name == "paged_attention_split_kv_merge_mi300") {
+    int variant_id =
+        task_register->register_paged_attention_split_kv_merge_mi300_task(
+            customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        2, 1, TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_MI300, variant_id);
+  } else if (name == "splitk_linear_res_atomic_mi300") {
+    // MIRAGE HIP COMPAT: splitk linear + 残差原子加（自 megakernel 移植）
+    int variant_id = task_register->register_splitk_linear_res_atomic_mi300_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(
+        5, 1, TASK_SPLITK_LINEAR_RES_ATOMIC_MI300, variant_id);
   } else if (name == "mla_decode_sm100") {
     int variant_id = task_register->register_mla_decode_sm100_task(
         customized->bgraph, params);

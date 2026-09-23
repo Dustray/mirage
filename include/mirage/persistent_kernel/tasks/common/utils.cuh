@@ -102,7 +102,15 @@ __forceinline__ __device__ float ptx_log2(float x) {
 }
 
 static __device__ __forceinline__ int lane_id() {
+// ==== MIRAGE HIP COMPAT: wave64 下 lane 应按 NUM_THREADS_PER_WARP 划分；原 & 0x1f
+// 按 32-lane 切分，导致同 wave 的 lane0 与 lane32 同时命中 lane_id()==0，
+// block 归约共享内存槽位出现双写竞争 ====
+#if defined(__HIP_PLATFORM_AMD__)
+  return threadIdx.x & (NUM_THREADS_PER_WARP - 1);
+#else
   return threadIdx.x & 0x1f;
+#endif
+  // ==== end MIRAGE HIP COMPAT ====
 }
 
 static __device__ __forceinline__ int warp_id() {

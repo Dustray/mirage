@@ -358,10 +358,15 @@ struct alignas(16) TaskDesc {
     }
 #endif
   }
+  // ==== MIRAGE HIP COMPAT: 保留上游构造语义（raw_payload = ~0ull 哨兵），
+  // 仅加 __host__ __device__ 修饰；__shared__ 数组的构造问题在
+  // persistent_kernel.cuh 用 char 存储 + reinterpret_cast 绕开（与
+  // megakernel 的 hip_compat 方案一致）====
   __host__ __device__
   TaskDesc() {
     task_metadata.raw_payload = ~0ull;
   }
+  // ==== end MIRAGE HIP COMPAT ====
   TaskType task_type;
   unsigned variant_id;
   EventId trigger_event;
@@ -398,6 +403,8 @@ struct RuntimeConfig {
   long long *output_tokens;       // Metadata for LLM serving
   long long eos_token_id;         // Metadata for LLM serving
   int max_seq_length;             // Metadata for LLM serving
+  // MIRAGE HIP COMPAT: profiling 迭代上限（自 megakernel 移植，0=不限）
+  int profiling_num_iters;        // Number of iterations in profiling mode
   int *new_token_nums;            // Metadata for LLM serving
   int *qo_indptr_buffer;          // Metadata for LLM serving (paged attention)
   int *paged_kv_indptr_buffer;    // Metadata for LLM serving (paged attention)

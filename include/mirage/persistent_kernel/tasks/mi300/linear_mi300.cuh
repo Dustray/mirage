@@ -36,6 +36,24 @@ namespace kernel {
 
 using bfloat16 = type::bfloat16_t;
 
+// MIRAGE HIP COMPAT: task_register.cc 发射的旧签名（模板携带 OUTPUT_SIZE/
+// O_STRIDE，调用点只传 6 个运行期参数）；转为对 linear_kernel_ck 的薄适配。
+template <typename T,
+          int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int REDUCTION_SIZE,
+          int O_STRIDE = OUTPUT_SIZE>
+__device__ __forceinline__ void linear_kernel(void const *input_ptr,
+                                              void const *weight_ptr,
+                                              void const *residual_ptr,
+                                              void *output_ptr,
+                                              int num_active_tokens,
+                                              bool residual_add) {
+  linear_kernel_ck<T, BATCH_SIZE, REDUCTION_SIZE, false>(
+      input_ptr, weight_ptr, residual_ptr, output_ptr, num_active_tokens,
+      residual_add, OUTPUT_SIZE, O_STRIDE);
+}
+
 // AMD MFMA-based GEMM using CK Tile library for optimized memory access
 template <typename T,
           int BATCH_SIZE,
